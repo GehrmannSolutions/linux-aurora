@@ -250,3 +250,91 @@
 };
 
 #include "hwmon-laptop.dtsi"
+
+/*
+ * External display on the left-back USB-C port (typec0, ATC0). In the J613
+ * ADT dcpext is display-crossbar ufp1, port 0, which is crossbar state 2
+ * (dispext1,0) in the T602x model, and ATC0's DisplayPort transmitter is
+ * dptx-phy 0. The right port (ATC1) is not described: it is untested.
+ *
+ * dcpext itself stays disabled here, like the internal DCP. The boot loader
+ * finds it through the "dcpext" alias, reserves its firmware and marks it
+ * apple,t8122-dcpext-firmware-ready; the kernel's display gate then enables
+ * it, together with typec-routes/route@0, after the internal display was
+ * handed over. The route stays disabled until then, as on T6030: an
+ * available route with no registered mode switch would make the Type-C
+ * port wait for one forever. A kernel or boot loader without dcpext
+ * support therefore sees nothing new.
+ *
+ * The display subsystem's iommus are left alone: the display gate accepts
+ * exactly one entry there (disp0_dart stream 0) before it enables the
+ * internal display, and adds <&dispext0_dart 0> itself when it enables
+ * dcpext, as it does for the T6030 external processors.
+ */
+/ {
+	aliases {
+		dcpext = &dcpext;
+	};
+};
+
+&dispext0_dart {
+	status = "okay";
+};
+
+&dcpext_dart {
+	status = "okay";
+};
+
+&dcpext_mbox {
+	status = "okay";
+};
+
+&atcphy0_xbar {
+	status = "okay";
+};
+
+&dcpext {
+	apple,connector-type = "USB-C";
+	phys = <&atcphy0 PHY_TYPE_DP>;
+	phy-names = "typec0";
+	mux-controls = <&atcphy0_xbar 0>;
+	mux-control-names = "typec0";
+	apple,typec-mux-indices = <2>;
+	apple,typec-dptx-phys = <0>;
+	/* RTKit quirks of AsahiLinux/linux#607 (syslog/ioreport acks, kdebug). */
+	apple,sync-syslog-ack;
+
+	typec-routes {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		route@0 {
+			reg = <0>;
+			mode-switch;
+			status = "disabled";
+
+			port {
+				dcpext_typec0: endpoint {
+					remote-endpoint = <&typec0_dcpext>;
+				};
+			};
+		};
+	};
+};
+
+&typec0 {
+	ports {
+		port@3 {
+			reg = <3>;
+
+			typec0_dcpext: endpoint {
+				remote-endpoint = <&dcpext_typec0>;
+			};
+		};
+	};
+};
+
+/* Needs to stay on for DisplayPort alternate mode across suspend, as on T8112. */
+&ps_atc0_common {
+	apple,always-on;
+};
