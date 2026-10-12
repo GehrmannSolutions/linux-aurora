@@ -214,8 +214,14 @@ const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp)
 	/*
 	 * The 14.7 firmware of an external processor answers EDID requests
 	 * once its service has been opened; open each announced instance once.
+	 *
+	 * Only on Aurora's DCPLink session (T6030). The T8122 dcpext, which
+	 * Linux starts and drives through the IOMFB template, reads the EDID
+	 * directly, as in AsahiLinux/linux#607. Its firmware never answers the
+	 * open call and drops the display link instead, about 50 ms after it,
+	 * which brings the display back 4 s later: hotplug in a loop.
 	 */
-	if (dcp_fw_is_14_7(dcp) &&
+	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7 &&
 	    READ_ONCE(dcp->dcpavserv.opened) != service) {
 		int ret = afk_service_call(service, 4, 6, NULL, 0, 32, NULL, 0, 32);
 
