@@ -3,7 +3,9 @@
 
 #include <linux/bitfield.h>
 #include <linux/debugfs.h>
+#include <linux/delay.h>
 #include <linux/dma-mapping.h>
+#include <linux/jiffies.h>
 #include <linux/kconfig.h>
 #include <linux/of_platform.h>
 #include <linux/slab.h>
@@ -112,6 +114,39 @@ void afk_shutdown(struct apple_dcp_afkep *afkep)
 	}
 }
 
+/*
+ * A processor that Linux starts itself with 14.7 firmware (the T8122
+ * dcpext): as in AsahiLinux/linux#607, give the firmware time to set up
+ * the endpoint after START_ENDPOINT, and poll the mailbox while waiting,
+ * because its ASCWrap can leave messages queued without another
+ * recv-not-empty interrupt after RTKit bootstrap.
+ */
+static int afk_start_polled(struct apple_dcp_afkep *ep)
+{
+	unsigned long timeout;
+	int ret;
+
+	usleep_range(10000, 11000);
+	afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_INIT));
+
+	timeout = jiffies + msecs_to_jiffies(1000);
+	do {
+		ret = apple_rtkit_poll(ep->dcp->rtk);
+		if (ret < 0)
+			return ret;
+
+		ret = wait_for_completion_timeout(&ep->started,
+						  msecs_to_jiffies(10));
+		if (ret > 0)
+			return 0;
+	} while (time_before(jiffies, timeout));
+
+	dev_err(ep->dcp->dev,
+		"RTKit AFK endpoint %02x did not acknowledge init\n",
+		ep->endpoint);
+	return -ETIMEDOUT;
+}
+
 int afk_start(struct apple_dcp_afkep *ep)
 {
 	int ret;
@@ -120,6 +155,8 @@ int afk_start(struct apple_dcp_afkep *ep)
 	ret = apple_rtkit_start_ep(ep->dcp->rtk, ep->endpoint);
 	if (ret)
 		return ret;
+	if (ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7_TEMPLATE)
+		return afk_start_polled(ep);
 	afk_send(ep, FIELD_PREP(RBEP_TYPE, RBEP_INIT));
 
 	ret = wait_for_completion_timeout(&ep->started, msecs_to_jiffies(1000));
