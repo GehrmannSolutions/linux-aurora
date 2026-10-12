@@ -501,6 +501,8 @@ static int dcp_dptx_connect_session(struct apple_dcp *dcp, u32 port,
 				    struct dcp_fabric_session session, bool cable,
 				    bool recovery)
 {
+	/* T8122 dcpext: HPD only after the link wait, see dcp_ext_dptx_607() */
+	bool late_hpd = dcp_ext_dptx_607(dcp);
 	unsigned long timeout;
 	u8 dfp_port;
 	int ret = 0;
@@ -553,14 +555,16 @@ static int dcp_dptx_connect_session(struct apple_dcp *dcp, u32 port,
 	dcp->dptxport[port].atcphy = dcp->phy;
 	/* a tiled display's second half comes in on the port's dpin1 */
 	dfp_port = port && READ_ONCE(dcp->split.active) ? 2 : dcp->dptx_dfp_port;
-	ret = dptxport_validate_connection(dcp->dptxport[port].service,
-					   dfp_port,
-					   dcp->dptx_phy, dcp->dptx_die);
-	if (ret) {
-		dev_err(dcp->dev,
-			"dcp_dptx_connect: failed to validate DPTX target %u:%u: %d\n",
-			dcp->dptx_die, dcp->dptx_phy, ret);
-		goto out_unlock;
+	if (!dcp_ext_dptx_607(dcp)) {
+		ret = dptxport_validate_connection(dcp->dptxport[port].service,
+						   dfp_port,
+						   dcp->dptx_phy, dcp->dptx_die);
+		if (ret) {
+			dev_err(dcp->dev,
+				"dcp_dptx_connect: failed to validate DPTX target %u:%u: %d\n",
+				dcp->dptx_die, dcp->dptx_phy, ret);
+			goto out_unlock;
+		}
 	}
 
 	if (!dcp_connect_session_valid_locked(dcp, session, cable, recovery)) {
@@ -570,7 +574,7 @@ static int dcp_dptx_connect_session(struct apple_dcp *dcp, u32 port,
 	ret = dptxport_connect(dcp->dptxport[port].service,
 			       dfp_port,
 			       dcp->dptx_phy, dcp->dptx_die,
-		       dcp_is_typec_output(dcp));
+			       dcp_is_typec_output(dcp) && !dcp_ext_dptx_607(dcp));
 	if (ret) {
 		dev_err(dcp->dev,
 			"dcp_dptx_connect: failed to connect DPTX target %u:%u: %d\n",
@@ -594,7 +598,7 @@ static int dcp_dptx_connect_session(struct apple_dcp *dcp, u32 port,
 		goto out_release;
 	}
 	dcp->dptxport[port].connected = true;
-	if (dcp_is_typec_output(dcp)) {
+	if (dcp_is_typec_output(dcp) && !late_hpd) {
 		if (dcp_uses_t6020_tunnel_flow(dcp))
 			ret = dptxport_set_hpd_timeout(dcp->dptxport[port].service,
 						       true, 8000);
@@ -631,16 +635,21 @@ static int dcp_dptx_connect_session(struct apple_dcp *dcp, u32 port,
 		ret = -ESTALE;
 		goto out_unlock;
 	}
-	if (!ret) {
+	if (!ret && late_hpd) {
+		/* Without HPD this firmware does not train: assert it now. */
+		dev_dbg(dcp->dev,
+			"dcp_dptx_connect: no link configuration on port %u yet, asserting HPD\n",
+			port);
+	} else if (!ret) {
 		dev_err(dcp->dev,
 			"dcp_dptx_connect: timed out waiting for port %u link configuration\n",
 			port);
 		ret = -ETIMEDOUT;
 		goto out_disconnect;
+	} else {
+		dev_dbg(dcp->dev, "dcp_dptx_connect: waited %d ms for link\n",
+			jiffies_to_msecs(timeout - ret));
 	}
-
-	dev_dbg(dcp->dev, "dcp_dptx_connect: waited %d ms for link\n",
-		jiffies_to_msecs(timeout - ret));
 
 	usleep_range(5, 10);
 	if (!dcp_connect_session_valid_locked(dcp, session, cable, recovery)) {
@@ -648,9 +657,13 @@ static int dcp_dptx_connect_session(struct apple_dcp *dcp, u32 port,
 		goto out_unlock;
 	}
 
-	if (dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort) {
+	if (dcp->connector_type == DRM_MODE_CONNECTOR_DisplayPort || late_hpd) {
 		ret = dptxport_set_hpd(dcp->dptxport[port].service, true);
-		if (ret && dcp->external)
+		if (ret && late_hpd)
+			dev_err(dcp->dev,
+				"dcp_dptx_connect: failed to assert HPD after the link wait: %d\n",
+				ret);
+		if (ret && (dcp->external || late_hpd))
 			goto out_disconnect;
 	}
 	if (!dcp_connect_session_valid_locked(dcp, session, cable, recovery)) {
