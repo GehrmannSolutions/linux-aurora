@@ -51,12 +51,20 @@ struct apple_rtkit {
 	unsigned int ap_power_state;
 	bool crashed;
 	bool shutting_down;
+	/*
+	 * apple,sync-syslog-ack (AsahiLinux/linux#607, the T8122 dcpext):
+	 * acknowledge syslog and ioreport traffic from the receive path,
+	 * hand out kdebug buffers, and poll the mailbox while waiting.
+	 */
+	bool sync_syslog_ack;
 
 	DECLARE_BITMAP(endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 
 	struct apple_rtkit_shmem ioreport_buffer;
 	struct apple_rtkit_shmem crashlog_buffer;
 	struct apple_rtkit_shmem oslog_buffer;
+	struct apple_rtkit_shmem kdebug_buffer0;
+	struct apple_rtkit_shmem kdebug_buffer1;
 
 	struct apple_rtkit_shmem syslog_buffer;
 	char *syslog_msg_buffer;

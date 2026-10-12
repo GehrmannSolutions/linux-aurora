@@ -6,6 +6,9 @@
 
 #include "rtkit-internal.h"
 
+#include <linux/jiffies.h>
+#include <linux/of.h>
+
 enum {
 	APPLE_RTKIT_PWR_STATE_OFF = 0x00, /* power off, cannot be restarted */
 	APPLE_RTKIT_PWR_STATE_SLEEP = 0x01, /* sleeping, can be restarted */
@@ -73,6 +76,18 @@ enum {
 #define APPLE_RTKIT_OSLOG_LOG_RESERVED GENMASK_ULL(55, 32)
 #define APPLE_RTKIT_OSLOG_SIZE GENMASK_ULL(55, 36)
 #define APPLE_RTKIT_OSLOG_IOVA GENMASK_ULL(35, 0)
+
+#define APPLE_RTKIT_KDEBUG_TYPE GENMASK_ULL(55, 48)
+#define APPLE_RTKIT_KDEBUG_DATA GENMASK_ULL(47, 0)
+
+enum {
+	APPLE_RTKIT_KDEBUG_GET_BUFFER = 1,
+	APPLE_RTKIT_KDEBUG_SET_BUFFER0 = 1,
+	APPLE_RTKIT_KDEBUG_SET_BUFFER1 = 2,
+	APPLE_RTKIT_KDEBUG_PREALLOC_BUFFER0 = 2,
+	APPLE_RTKIT_KDEBUG_PREALLOC_BUFFER1 = 3,
+	APPLE_RTKIT_KDEBUG_START = 8,
+};
 
 #define APPLE_RTKIT_MIN_SUPPORTED_VERSION 11
 #define APPLE_RTKIT_MAX_SUPPORTED_VERSION 12
@@ -215,6 +230,12 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 			dev_dbg(rtk->dev,
 				"RTKit: Starting system endpoint 0x%02x\n", ep);
 			ret = apple_rtkit_start_ep(rtk, ep);
+			/* #607: start kdebug, which then asks for its buffers. */
+			if (!ret && rtk->sync_syslog_ack && ep == APPLE_RTKIT_EP_DEBUG)
+				ret = apple_rtkit_send_message(rtk, ep,
+							       FIELD_PREP(APPLE_RTKIT_KDEBUG_TYPE,
+									  APPLE_RTKIT_KDEBUG_START),
+							       NULL, false);
 			if (ret) {
 				rtk->boot_result = ret;
 				complete_all(&rtk->epmap_completion);
@@ -393,6 +414,99 @@ static void apple_rtkit_free_buffer(struct apple_rtkit *rtk,
 	bfr->is_mapped = false;
 	bfr->needs_dma_sync = false;
 	bfr->private = NULL;
+}
+
+static int apple_rtkit_kdebug_alloc_buffer(struct apple_rtkit *rtk,
+					   struct apple_rtkit_shmem *buffer,
+					   size_t size)
+{
+	int err;
+
+	/* Firmware may still be using buffers from an earlier request. */
+	if (buffer->size)
+		return buffer->size == size ? 0 : -EINVAL;
+
+	buffer->size = size;
+	buffer->iova = 0;
+	buffer->buffer = NULL;
+	buffer->iomem = NULL;
+	buffer->is_mapped = false;
+
+	if (rtk->ops->shmem_setup) {
+		err = rtk->ops->shmem_setup(rtk->cookie, buffer);
+		if (err)
+			goto error;
+	} else {
+		buffer->buffer = dma_alloc_coherent(rtk->dev, buffer->size,
+						    &buffer->iova, GFP_KERNEL);
+		if (!buffer->buffer) {
+			err = -ENOMEM;
+			goto error;
+		}
+	}
+
+	return 0;
+
+error:
+	buffer->size = 0;
+	return err;
+}
+
+/* kdebug buffer requests (AsahiLinux/linux#607), apple,sync-syslog-ack only. */
+static void apple_rtkit_kdebug_rx(struct apple_rtkit *rtk, u64 msg)
+{
+	u8 type = FIELD_GET(APPLE_RTKIT_KDEBUG_TYPE, msg);
+	u64 count, reply;
+	size_t size;
+	int err;
+
+	switch (type) {
+	case APPLE_RTKIT_KDEBUG_GET_BUFFER:
+		count = FIELD_GET(APPLE_RTKIT_KDEBUG_DATA, msg);
+		if (!count || count > (SIZE_MAX - 0x3fff) / 0x20) {
+			err = -EINVAL;
+			goto error;
+		}
+
+		size = ALIGN((size_t)count * 0x20, 0x4000);
+		err = apple_rtkit_kdebug_alloc_buffer(rtk, &rtk->kdebug_buffer0,
+						      size);
+		if (err)
+			goto error;
+
+		err = apple_rtkit_kdebug_alloc_buffer(rtk, &rtk->kdebug_buffer1,
+						      0x2000);
+		if (err)
+			goto error;
+
+		reply = FIELD_PREP(APPLE_RTKIT_KDEBUG_TYPE,
+				   APPLE_RTKIT_KDEBUG_SET_BUFFER0) |
+			FIELD_PREP(APPLE_RTKIT_KDEBUG_DATA,
+				   rtk->kdebug_buffer0.iova);
+		err = apple_rtkit_send_message(rtk, APPLE_RTKIT_EP_DEBUG, reply,
+					       NULL, false);
+		if (err)
+			goto error;
+
+		reply = FIELD_PREP(APPLE_RTKIT_KDEBUG_TYPE,
+				   APPLE_RTKIT_KDEBUG_SET_BUFFER1) |
+			FIELD_PREP(APPLE_RTKIT_KDEBUG_DATA,
+				   rtk->kdebug_buffer1.iova);
+		err = apple_rtkit_send_message(rtk, APPLE_RTKIT_EP_DEBUG, reply,
+					       NULL, false);
+		if (err)
+			goto error;
+		break;
+	case APPLE_RTKIT_KDEBUG_PREALLOC_BUFFER0:
+	case APPLE_RTKIT_KDEBUG_PREALLOC_BUFFER1:
+		break;
+	default:
+		dev_warn_ratelimited(rtk->dev, "RTKit: Unknown kdebug message: %llx\n", msg);
+	}
+	return;
+
+error:
+	dev_err_ratelimited(rtk->dev, "RTKit: kdebug buffer request failed: %d\n", err);
 }
 
 static void apple_rtkit_memcpy(struct apple_rtkit *rtk, void *dst,
@@ -634,6 +748,17 @@ static void apple_rtkit_oslog_rx(struct apple_rtkit *rtk, u64 msg)
 						 APPLE_RTKIT_EP_OSLOG, msg);
 		break;
 	case APPLE_RTKIT_OSLOG_LOG:
+		/*
+		 * apple,sync-syslog-ack co-processors (the T8122 dcpext) are
+		 * not acknowledged, as in AsahiLinux/linux#607, which drives
+		 * that firmware: it then sends one notification and keeps its
+		 * log to itself.
+		 */
+		if (rtk->sync_syslog_ack) {
+			dev_dbg(rtk->dev, "RTKit: oslog notification %llx not acknowledged\n",
+				msg);
+			break;
+		}
 		/* Channel zero reports a cumulative 32-bit write counter. Even
 		 * though we discard these logs, acknowledge that exact counter:
 		 * AppleDCP waits for its log transport to drain before AP sleep.
@@ -679,6 +804,14 @@ static void apple_rtkit_rx_work(struct work_struct *work)
 	case APPLE_RTKIT_EP_IOREPORT:
 		apple_rtkit_ioreport_rx(rtk, rtk_work->msg);
 		break;
+	case APPLE_RTKIT_EP_DEBUG:
+		if (rtk->sync_syslog_ack)
+			apple_rtkit_kdebug_rx(rtk, rtk_work->msg);
+		else
+			dev_warn(rtk->dev,
+				 "RTKit: message to unknown endpoint %02x: %llx\n",
+				 rtk_work->ep, rtk_work->msg);
+		break;
 	case APPLE_RTKIT_EP_OSLOG:
 		apple_rtkit_oslog_rx(rtk, rtk_work->msg);
 		break;
@@ -718,6 +851,23 @@ static void apple_rtkit_rx(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 	 * afterwards.
 	 */
 	dma_rmb();
+
+	/*
+	 * AsahiLinux/linux#607: this firmware wants syslog and ioreport
+	 * notifications acknowledged right away, from the receive path.
+	 */
+	if (rtk->sync_syslog_ack && ep == APPLE_RTKIT_EP_SYSLOG &&
+	    FIELD_GET(APPLE_RTKIT_SYSLOG_TYPE, msg.msg0) ==
+		APPLE_RTKIT_SYSLOG_LOG) {
+		apple_rtkit_send_message(rtk, ep, msg.msg0, NULL, true);
+		return;
+	}
+	if (rtk->sync_syslog_ack && ep == APPLE_RTKIT_EP_IOREPORT &&
+	    (FIELD_GET(APPLE_RTKIT_SYSLOG_TYPE, msg.msg0) == 0x8 ||
+	     FIELD_GET(APPLE_RTKIT_SYSLOG_TYPE, msg.msg0) == 0xc)) {
+		apple_rtkit_send_message(rtk, ep, msg.msg0, NULL, true);
+		return;
+	}
 
 	if (!test_bit(ep, rtk->endpoints))
 		dev_warn(rtk->dev,
@@ -908,6 +1058,8 @@ static struct apple_rtkit *__apple_rtkit_init(struct device *dev, void *cookie,
 	rtk->dev = dev;
 	rtk->cookie = cookie;
 	rtk->ops = ops;
+	rtk->sync_syslog_ack =
+		of_property_read_bool(dev->of_node, "apple,sync-syslog-ack");
 
 	init_completion(&rtk->epmap_completion);
 	init_completion(&rtk->iop_pwr_ack_completion);
@@ -974,6 +1126,39 @@ struct apple_rtkit *apple_rtkit_init_adopted(struct device *dev, void *cookie,
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_init_adopted);
 
+static int apple_rtkit_wait_for_completion(struct completion *c);
+
+/*
+ * apple,sync-syslog-ack (AsahiLinux/linux#607): the mailbox can leave
+ * messages queued without another interrupt during bootstrap, so poll it
+ * while waiting. Everyone else waits as before.
+ */
+static int apple_rtkit_wait(struct apple_rtkit *rtk, struct completion *c)
+{
+	unsigned long timeout;
+	long t;
+	int ret;
+
+	if (!rtk->sync_syslog_ack)
+		return apple_rtkit_wait_for_completion(c);
+
+	timeout = jiffies + msecs_to_jiffies(1000);
+	do {
+		ret = apple_rtkit_poll(rtk);
+		if (ret < 0)
+			return ret;
+
+		t = wait_for_completion_interruptible_timeout(c,
+							      msecs_to_jiffies(10));
+		if (t < 0)
+			return t;
+		if (t > 0)
+			return 0;
+	} while (time_before(jiffies, timeout));
+
+	return -ETIME;
+}
+
 static int apple_rtkit_wait_for_completion(struct completion *c)
 {
 	long t;
@@ -1001,6 +1186,8 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 	apple_rtkit_free_buffer(rtk, &rtk->crashlog_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->oslog_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->syslog_buffer);
+	apple_rtkit_free_buffer(rtk, &rtk->kdebug_buffer0);
+	apple_rtkit_free_buffer(rtk, &rtk->kdebug_buffer1);
 
 	kfree(rtk->syslog_msg_buffer);
 
@@ -1050,7 +1237,7 @@ static int apple_rtkit_set_ap_power_state(struct apple_rtkit *rtk,
 	if (ret)
 		return ret;
 
-	ret = apple_rtkit_wait_for_completion(&rtk->ap_pwr_ack_completion);
+	ret = apple_rtkit_wait(rtk, &rtk->ap_pwr_ack_completion);
 	if (ret)
 		return ret;
 
@@ -1073,7 +1260,7 @@ static int apple_rtkit_set_iop_power_state(struct apple_rtkit *rtk,
 	if (ret)
 		return ret;
 
-	ret = apple_rtkit_wait_for_completion(&rtk->iop_pwr_ack_completion);
+	ret = apple_rtkit_wait(rtk, &rtk->iop_pwr_ack_completion);
 	if (ret)
 		return ret;
 
@@ -1092,7 +1279,7 @@ static int apple_rtkit_boot_common(struct apple_rtkit *rtk, bool early_ap_power)
 		return -EINVAL;
 
 	dev_dbg(rtk->dev, "RTKit: waiting for boot to finish\n");
-	ret = apple_rtkit_wait_for_completion(&rtk->epmap_completion);
+	ret = apple_rtkit_wait(rtk, &rtk->epmap_completion);
 	if (ret)
 		return ret;
 	if (rtk->boot_result)
@@ -1106,7 +1293,7 @@ static int apple_rtkit_boot_common(struct apple_rtkit *rtk, bool early_ap_power)
 	}
 
 	dev_dbg(rtk->dev, "RTKit: waiting for IOP power state ACK\n");
-	ret = apple_rtkit_wait_for_completion(&rtk->iop_pwr_ack_completion);
+	ret = apple_rtkit_wait(rtk, &rtk->iop_pwr_ack_completion);
 	if (ret)
 		return ret;
 
@@ -1251,6 +1438,8 @@ void apple_rtkit_free(struct apple_rtkit *rtk)
 	apple_rtkit_free_buffer(rtk, &rtk->crashlog_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->oslog_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->syslog_buffer);
+	apple_rtkit_free_buffer(rtk, &rtk->kdebug_buffer0);
+	apple_rtkit_free_buffer(rtk, &rtk->kdebug_buffer1);
 
 	kfree(rtk->syslog_msg_buffer);
 	apple_rtkit_release_rx(rtk);
