@@ -24,6 +24,7 @@
 #include <linux/slab.h>
 #include <linux/soc/apple/rtkit.h>
 #include <linux/soc/apple/j613-display.h>
+#include <linux/soc/apple/pmp-report.h>
 #include <linux/string.h>
 #include <linux/usb/typec_altmode.h>
 #include <linux/usb/typec_dp.h>
@@ -2192,6 +2193,49 @@ static bool dcp_show_notch(struct apple_dcp *dcp)
 	return show_notch || t6030_show_notch;
 }
 
+/*
+ * T8122 dcpext (DCP_FIRMWARE_V_14_7_TEMPLATE): if the PMP runs, the display
+ * gate added its DISPEXT request and pointed the dcpext at it
+ * (apple,pmp-report). As on T6030, run the processor only once the PMP has
+ * acknowledged that request: the running PMP owns the SoC power and
+ * performance states and treats a block whose request it has not taken as
+ * idle. The internal display started the PMP long before this, so the wait
+ * is short; it is bounded, and without an acknowledgement the processor is
+ * started anyway (as before the request existed), with a warning.
+ */
+#define DCP_EXT_PMP_TIMEOUT_MS	3000
+
+static void dcp_ext_wait_pmp(struct apple_dcp *dcp)
+{
+	struct device_node *entry;
+	unsigned long deadline;
+	int ret;
+
+	if (dcp->fw_compat != DCP_FIRMWARE_V_14_7_TEMPLATE)
+		return;
+	entry = of_parse_phandle(dcp->dev->of_node, "apple,pmp-report", 0);
+	if (!entry) {
+		dev_info(dcp->dev, "no PMP DISPEXT request; starting without one\n");
+		return;
+	}
+	deadline = jiffies + msecs_to_jiffies(DCP_EXT_PMP_TIMEOUT_MS);
+	for (;;) {
+		ret = apple_pmp_report_wait_ready(entry,
+						  msecs_to_jiffies(DCP_EXT_PMP_TIMEOUT_MS));
+		/* -EIO: the PMP runs, but has not acknowledged the request yet. */
+		if (ret != -EIO || time_after(jiffies, deadline))
+			break;
+		msleep(20);
+	}
+	of_node_put(entry);
+	if (ret)
+		dev_warn(dcp->dev,
+			 "the PMP has not acknowledged the DISPEXT request (%d); starting anyway\n",
+			 ret);
+	else
+		dev_info(dcp->dev, "PMP acknowledged the DISPEXT request\n");
+}
+
 static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *data)
 {
 	struct device_node *panel_np;
@@ -2306,6 +2350,8 @@ static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *dat
 
 	dcp->swapped_out_fbs =
 		(struct list_head)LIST_HEAD_INIT(dcp->swapped_out_fbs);
+
+	dcp_ext_wait_pmp(dcp);
 
 	cpu_ctrl =
 		readl_relaxed(dcp->coproc_reg + APPLE_DCP_COPROC_CPU_CONTROL);
