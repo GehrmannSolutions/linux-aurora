@@ -1205,6 +1205,10 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 	bool was_counted;
 	int ret = 0;
 
+	/* A failed T8122 dcpext drives nothing; USB on the port goes on. */
+	if (READ_ONCE(route->dcp->ext_dead))
+		return 0;
+
 	guard(mutex)(&dcp_typec_fabric_lock);
 
 	/*
@@ -3114,6 +3118,29 @@ bool dcp_typec_port_has_candidate(unsigned int idx, struct platform_device *pdev
 			return true;
 
 	return false;
+}
+
+/*
+ * Is every pipeline that can drive port @idx unusable (a failed T8122
+ * dcpext)? Such a port gets no connector, rather than failing the DRM
+ * device of the internal panel.
+ */
+bool dcp_typec_port_unusable(unsigned int idx)
+{
+	struct apple_dcp_typec_port *port;
+	struct apple_dcp_typec_route *route;
+
+	guard(mutex)(&dcp_typec_fabric_lock);
+
+	port = dcp_typec_port_by_index(idx);
+	if (!port || list_empty(&port->routes))
+		return false;
+
+	list_for_each_entry(route, &port->routes, port_link)
+		if (!READ_ONCE(route->dcp->ext_dead))
+			return false;
+
+	return true;
 }
 
 void dcp_typec_port_set_connector(unsigned int idx, bool secondary,
