@@ -79,6 +79,7 @@ struct dcp_packet_header {
 
 enum iomfb_property_id {
     IOMFB_PROPERTY_NITS = 15, // divide by Brightness_Scale
+    IOMFB_PROPERTY_NITS_V14_7 = 19, // the same, on 14.7 firmware
 };
 
 #define IOMFB_BRIGHTNESS_MIN 0x10000000
