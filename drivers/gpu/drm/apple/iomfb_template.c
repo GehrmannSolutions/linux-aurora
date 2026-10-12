@@ -1104,6 +1104,9 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 		schedule_work(&dcp->vblank_wq);
 		return;
 	}
+	/* T8122 dcpext: a display link in a connect/drop loop is not reported. */
+	if (dcp_ext_flap_filter(dcp, !!(*connected)))
+		return;
 	if (dcp_is_typec_output(dcp) && *connected && dcp->nr_modes)
 		complete_all(&dcp->typec_iomfb_hpd_ready);
 

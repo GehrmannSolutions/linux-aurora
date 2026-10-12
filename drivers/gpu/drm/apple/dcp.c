@@ -511,6 +511,9 @@ static int dcp_dptx_connect_session(struct apple_dcp *dcp, u32 port,
 	/* A native external processor starts here; its start retries this. */
 	if (dcp->external_native && !iomfb_v14_7_external_ready(dcp))
 		return -EAGAIN;
+	/* The T8122 flap guard holds the link down; it connects it later. */
+	if (dcp_ext_flap_parked(dcp))
+		return -EBUSY;
 	/* @port selects the upstream RemotePort service/core. dptx_dfp_port
 	 * is the downstream address: dpphy=0, dpin0=1, dpin1=2.
 	 */
@@ -1022,6 +1025,9 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 	ret = dcp_dptx_connect_session(dcp, 0, session, true, false);
 	if (!ret)
 		ret = dcp_dptx_connect_tile(dcp);
+	/* No retries while the T8122 flap guard holds the link down. */
+	if (ret == -EBUSY && dcp_ext_flap_parked(dcp))
+		return;
 	guard(mutex)(&dcp->hpd_mutex);
 	if (!dcp_session_valid_locked(dcp, session, true))
 		return;
@@ -1101,6 +1107,151 @@ int dcp_dptx_disconnect(struct apple_dcp *dcp, u32 port)
 	return ret;
 }
 
+/*
+ * DP flap guard of the T8122 dcpext (DCP_FIRMWARE_V_14_7_TEMPLATE only).
+ *
+ * A display link that the firmware keeps bringing up and dropping makes the
+ * connector flap, and every flap is a hotplug event that makes the desktop
+ * probe all outputs again. When DCP_EXT_FLAP_CONNECTS connects reach DRM
+ * within DCP_EXT_FLAP_WINDOW, the guard trips: the connect is not reported
+ * (the connector stays disconnected), the display link is released so the
+ * firmware stops retraining it, nothing connects it again, and firmware
+ * hotplug is ignored for a backoff period. Then the link is connected once
+ * more. The backoff starts at DCP_EXT_FLAP_BACKOFF_S and doubles on each
+ * trip up to DCP_EXT_FLAP_BACKOFF_MAX_S; it starts over after
+ * DCP_EXT_FLAP_CALM without a trip.
+ */
+#define DCP_EXT_FLAP_WINDOW		(30 * HZ)
+#define DCP_EXT_FLAP_BACKOFF_S		60U
+#define DCP_EXT_FLAP_BACKOFF_MAX_S	960U
+#define DCP_EXT_FLAP_CALM		(600 * HZ)
+
+static bool dcp_ext_flap_guarded(const struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_14_7_TEMPLATE;
+}
+
+bool dcp_ext_flap_parked(struct apple_dcp *dcp)
+{
+	return dcp_ext_flap_guarded(dcp) && READ_ONCE(dcp->ext_flap.parked);
+}
+
+/*
+ * For each hotplug the firmware reports through the IOMFB template. Returns
+ * true if the report must be dropped.
+ */
+bool dcp_ext_flap_filter(struct apple_dcp *dcp, bool connected)
+{
+	struct apple_connector *connector = dcp->connector;
+	unsigned long now = jiffies, flags, first;
+	unsigned int i, n = 0, backoff;
+
+	if (!dcp_ext_flap_guarded(dcp))
+		return false;
+
+	spin_lock_irqsave(&dcp->ext_flap.lock, flags);
+	if (dcp->ext_flap.parked) {
+		spin_unlock_irqrestore(&dcp->ext_flap.lock, flags);
+		return true;
+	}
+	/* Only a connect that makes a disconnected connector connected counts. */
+	if (!connected || !connector || READ_ONCE(connector->connected)) {
+		spin_unlock_irqrestore(&dcp->ext_flap.lock, flags);
+		return false;
+	}
+	for (i = 0; i < dcp->ext_flap.nr_connects; i++)
+		if (time_before(now, dcp->ext_flap.connects[i] + DCP_EXT_FLAP_WINDOW))
+			dcp->ext_flap.connects[n++] = dcp->ext_flap.connects[i];
+	if (n + 1 < DCP_EXT_FLAP_CONNECTS) {
+		dcp->ext_flap.connects[n++] = now;
+		dcp->ext_flap.nr_connects = n;
+		spin_unlock_irqrestore(&dcp->ext_flap.lock, flags);
+		return false;
+	}
+
+	first = n ? dcp->ext_flap.connects[0] : now;
+	backoff = dcp->ext_flap.backoff_s;
+	if (!backoff ||
+	    time_after(now, dcp->ext_flap.last_trip + backoff * HZ + DCP_EXT_FLAP_CALM))
+		backoff = DCP_EXT_FLAP_BACKOFF_S;
+	else
+		backoff = min(2 * backoff, DCP_EXT_FLAP_BACKOFF_MAX_S);
+	dcp->ext_flap.backoff_s = backoff;
+	dcp->ext_flap.last_trip = now;
+	dcp->ext_flap.nr_connects = 0;
+	WRITE_ONCE(dcp->ext_flap.parked, true);
+	spin_unlock_irqrestore(&dcp->ext_flap.lock, flags);
+
+	dev_warn(dcp->dev,
+		 "DP link flapping (%u connects in %u ms): not reporting it, display link held down for %u s\n",
+		 DCP_EXT_FLAP_CONNECTS, jiffies_to_msecs(now - first), backoff);
+	schedule_work(&dcp->ext_flap.park_work);
+	return true;
+}
+
+/* Release the display link, so that the firmware stops retraining it. */
+static void dcp_ext_flap_park_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(work, struct apple_dcp, ext_flap.park_work);
+	int ret;
+
+	cancel_delayed_work_sync(&dcp->typec_reconnect_wq);
+	cancel_delayed_work_sync(&dcp->placeholder_edid_wq);
+	if (dcp->avep)
+		av_service_disconnect(dcp);
+
+	scoped_guard(mutex, &dcp->hpd_mutex) {
+		if (!READ_ONCE(dcp->ext_flap.parked))
+			return;
+		/* Revokes connects waiting for their link and queued reconnects. */
+		dcp->typec_generation++;
+		if (dcp->dptxport[0].enabled && dcp->dptxport[0].connected) {
+			ret = dptxport_set_hpd(dcp->dptxport[0].service, false);
+			if (ret)
+				dev_warn(dcp->dev, "DP flap guard: HPD deassert failed: %d\n", ret);
+			ret = dcp_dptx_release_locked(dcp, 0);
+			if (ret)
+				dev_warn(dcp->dev, "DP flap guard: display release failed: %d\n",
+					 ret);
+		}
+	}
+
+	mod_delayed_work(system_freezable_wq, &dcp->ext_flap.resume_work,
+			 READ_ONCE(dcp->ext_flap.backoff_s) * HZ);
+}
+
+static void dcp_ext_flap_resume_work(struct work_struct *work)
+{
+	struct apple_dcp *dcp = container_of(to_delayed_work(work), struct apple_dcp,
+					     ext_flap.resume_work);
+	unsigned long flags;
+
+	spin_lock_irqsave(&dcp->ext_flap.lock, flags);
+	WRITE_ONCE(dcp->ext_flap.parked, false);
+	dcp->ext_flap.nr_connects = 0;
+	spin_unlock_irqrestore(&dcp->ext_flap.lock, flags);
+
+	if (!READ_ONCE(dcp->typec_cable_connected)) {
+		dev_info(dcp->dev, "DP flap guard: backoff over, no display attached\n");
+		return;
+	}
+	dev_info(dcp->dev, "DP flap guard: backoff over, connecting the display link again\n");
+	scoped_guard(mutex, &dcp->hpd_mutex)
+		dcp->typec_reconnect_tries = 0;
+	dcp_queue_typec_reconnect(dcp, 0);
+}
+
+/* Bind, suspend and unbind end a backoff: the next start is a fresh one. */
+static void dcp_ext_flap_reset(struct apple_dcp *dcp)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&dcp->ext_flap.lock, flags);
+	WRITE_ONCE(dcp->ext_flap.parked, false);
+	dcp->ext_flap.nr_connects = 0;
+	spin_unlock_irqrestore(&dcp->ext_flap.lock, flags);
+}
+
 int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
@@ -1122,7 +1273,8 @@ int dcp_dptx_connect_oob(struct platform_device *pdev, u32 port)
 	}
 
 	ret = dcp_dptx_connect(dcp, port);
-	if (ret && ret != -ESHUTDOWN && dcp_is_typec_output(dcp))
+	if (ret && ret != -ESHUTDOWN && dcp_is_typec_output(dcp) &&
+	    !(ret == -EBUSY && dcp_ext_flap_parked(dcp)))
 		dcp_queue_typec_reconnect(dcp, DPTX_RECONNECT_DELAY);
 
 	return ret;
@@ -2004,6 +2156,9 @@ static void dcp_disable_typec_work(struct apple_dcp *dcp, bool release_cable)
 	disable_delayed_work_sync(&dcp->placeholder_edid_wq);
 	disable_delayed_work_sync(&dcp->hdmi_settle_wq);
 	disable_delayed_work_sync(&dcp->hdmi_recheck_wq);
+	disable_work_sync(&dcp->ext_flap.park_work);
+	disable_delayed_work_sync(&dcp->ext_flap.resume_work);
+	dcp_ext_flap_reset(dcp);
 	dcp_hdmi_disable(dcp);
 }
 
@@ -2013,6 +2168,8 @@ static void dcp_enable_typec_work(struct apple_dcp *dcp)
 	enable_delayed_work(&dcp->placeholder_edid_wq);
 	enable_delayed_work(&dcp->hdmi_settle_wq);
 	enable_delayed_work(&dcp->hdmi_recheck_wq);
+	enable_work(&dcp->ext_flap.park_work);
+	enable_delayed_work(&dcp->ext_flap.resume_work);
 	dcp_hdmi_enable(dcp);
 	scoped_guard(mutex, &dcp->hpd_mutex)
 		dcp->typec_work_enabled = true;
@@ -2409,9 +2566,14 @@ static int dcp_platform_probe_pipe(struct platform_device *pdev)
 			  dcp_typec_reconnect_work);
 	INIT_DELAYED_WORK(&dcp->placeholder_edid_wq,
 			  dcp_placeholder_edid_work);
+	spin_lock_init(&dcp->ext_flap.lock);
+	INIT_WORK(&dcp->ext_flap.park_work, dcp_ext_flap_park_work);
+	INIT_DELAYED_WORK(&dcp->ext_flap.resume_work, dcp_ext_flap_resume_work);
 	/* Balanced by enable at successful component bind. */
 	disable_delayed_work(&dcp->typec_reconnect_wq);
 	disable_delayed_work(&dcp->placeholder_edid_wq);
+	disable_work(&dcp->ext_flap.park_work);
+	disable_delayed_work(&dcp->ext_flap.resume_work);
 	/*
 	 * A native external pipe's bind enables these; firmware callbacks may
 	 * come before it. The 14.7 panel never uses them, but suspend cancels

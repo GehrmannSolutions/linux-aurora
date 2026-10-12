@@ -20,6 +20,9 @@
 #include "dptxep.h"
 #include "iomfb.h"
 #include "iomfb-state.h"
+
+/* T8122 dcpext flap guard: this many connects within the window trip it */
+#define DCP_EXT_FLAP_CONNECTS	3
 #include "iomfb_v12_3.h"
 #include "iomfb_v13_3.h"
 #include "iomfb_v14_7.h"
@@ -163,6 +166,23 @@ struct apple_dcp {
 	 */
 	bool ext_failsafe;
 	bool ext_dead;
+	/*
+	 * T8122 dcpext DP flap guard, see dcp_ext_flap_filter(). Only the
+	 * DCP_FIRMWARE_V_14_7_TEMPLATE pipe uses it.
+	 */
+	struct {
+		/* protects the flap guard state below */
+		spinlock_t lock;
+		/* jiffies of the latest connects reported to DRM */
+		unsigned long connects[DCP_EXT_FLAP_CONNECTS];
+		unsigned int nr_connects;
+		/* the link is held down and hotplug is not reported */
+		bool parked;
+		unsigned int backoff_s;
+		unsigned long last_trip;
+		struct work_struct park_work;
+		struct delayed_work resume_work;
+	} ext_flap;
 	/*
 	 * A T6030 external processor in the main DRM device: the kernel starts
 	 * its firmware on first use, its modes come from the attached display.
@@ -439,6 +459,9 @@ int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);
 s32 dcp_ext_backlight_value(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
+
+bool dcp_ext_flap_filter(struct apple_dcp *dcp, bool connected);
+bool dcp_ext_flap_parked(struct apple_dcp *dcp);
 
 /*
  * Does @dcp run 14.7 firmware, whichever IOMFB path drives it? For the
