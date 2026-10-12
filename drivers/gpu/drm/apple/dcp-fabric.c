@@ -3300,127 +3300,161 @@ struct dcp_route_probe_context {
 	struct device_node *routes;
 };
 
+/* Registers @route_np, the Type-C route with index @route_index. */
+static int dcp_register_one_typec_route(struct apple_dcp *dcp,
+					struct device_node *route_np,
+					u32 route_index)
+{
+	struct device *dev = dcp->dev;
+	struct apple_dcp_typec_route *route;
+	struct device_node *endpoint __free(device_node) = NULL;
+	struct device_node *connector_np;
+	struct typec_mux_desc desc = {};
+	const char *name, *mux_name;
+	int ret;
+
+	name = devm_kasprintf(dev, GFP_KERNEL, "typec%u", route_index);
+	if (!name)
+		return -ENOMEM;
+
+	/*
+	 * The DT lookups above are per-DCP, but the typec_mux class is
+	 * global. Several DCPs can offer a route to the same Type-C port,
+	 * so the registered mux needs a name unique across all of them.
+	 */
+	mux_name = devm_kasprintf(dev, GFP_KERNEL, "%s-typec%u",
+				  dev_name(dev), route_index);
+	if (!mux_name)
+		return -ENOMEM;
+
+	route = &dcp->typec_routes[dcp->nr_typec_routes];
+	route->dcp = dcp;
+	INIT_LIST_HEAD(&route->port_link);
+	route->phy = devm_phy_get(dev, name);
+	if (IS_ERR(route->phy))
+		return dev_err_probe(dev, PTR_ERR(route->phy),
+				     "%pOF: failed to get DP PHY\n", route_np);
+
+	route->xbar = devm_mux_control_get(dev, name);
+	if (IS_ERR(route->xbar))
+		return dev_err_probe(dev, PTR_ERR(route->xbar),
+				     "%pOF: failed to get display crossbar\n", route_np);
+
+	ret = of_property_read_u32_index(dev->of_node, "apple,typec-mux-indices",
+					 route_index, &route->mux_index);
+	if (ret)
+		return dev_err_probe(dev, ret, "%pOF: missing crossbar state\n",
+				     route_np);
+
+	ret = of_property_read_u32_index(dev->of_node, "apple,typec-dptx-phys",
+					 route_index, &route->dptx_phy);
+	if (ret)
+		return dev_err_probe(dev, ret, "%pOF: missing DPTX PHY index\n",
+				     route_np);
+
+	endpoint = of_graph_get_next_endpoint(route_np, NULL);
+	if (!endpoint)
+		return dev_err_probe(dev, -EINVAL,
+				     "%pOF: missing Type-C graph endpoint\n",
+				     route_np);
+	connector_np = of_graph_get_remote_port_parent(endpoint);
+	if (!connector_np)
+		return dev_err_probe(dev, -EINVAL,
+				     "%pOF: missing Type-C connector\n",
+				     route_np);
+
+	ret = dcp_typec_route_wiring(route, connector_np, route_index);
+	if (ret) {
+		of_node_put(connector_np);
+		return dev_err_probe(dev, ret, "%pOF: invalid DPIN wiring\n", route_np);
+	}
+
+	mutex_lock(&dcp_typec_fabric_lock);
+	route->port = dcp_typec_port_get(connector_np);
+	if (route->port) {
+		list_add_tail(&route->port_link, &route->port->routes);
+		if (route->dual_stream)
+			atomic_inc(&dcp_dual_stream_routes);
+	}
+	mutex_unlock(&dcp_typec_fabric_lock);
+	if (!route->port)
+		return -ENOMEM;
+
+	desc.fwnode = of_fwnode_handle(route_np);
+	desc.set = dcp_typec_route_set;
+	desc.name = mux_name;
+	desc.drvdata = route;
+	route->typec_mux = typec_mux_register(dev, &desc);
+	if (IS_ERR(route->typec_mux)) {
+		mutex_lock(&dcp_typec_fabric_lock);
+		list_del(&route->port_link);
+		if (route->dual_stream)
+			atomic_dec(&dcp_dual_stream_routes);
+		if (list_empty(&route->port->routes)) {
+			list_del(&route->port->link);
+			of_node_put(route->port->connector_np);
+			kfree(route->port);
+		}
+		mutex_unlock(&dcp_typec_fabric_lock);
+		return dev_err_probe(dev, PTR_ERR(route->typec_mux),
+				     "%pOF: failed to register Type-C route\n", route_np);
+	}
+
+	ret = devm_add_action_or_reset(dev, dcp_typec_route_unregister, route);
+	if (ret)
+		return ret;
+
+	if (!dcp->phy)
+		dcp->phy = route->phy;
+	dcp->nr_typec_routes++;
+	return 0;
+}
+
 static int dcp_register_typec_routes_present(void *data)
 {
 	struct dcp_route_probe_context *ctx = data;
 	struct apple_dcp *dcp = ctx->dcp;
 	struct device_node *routes = ctx->routes;
+	struct device_node *ordered[DCP_MAX_TYPEC_ROUTES] = {};
 	struct device *dev = dcp->dev;
+	unsigned int nr = 0, i;
 	u32 route_index;
-	int ret;
+	int ret = 0;
 
+	/*
+	 * Register the routes in the order of their index, not of the device
+	 * tree: route 0 is the pipeline's default PHY (dcp->phy before any
+	 * route is selected, and where it parks), and the ports' connector
+	 * numbers follow this order. A route added at run time (the T8122
+	 * display gate's front-port route) comes first among its siblings.
+	 */
 	for_each_available_child_of_node_scoped(routes, route_np) {
-		struct apple_dcp_typec_route *route;
-		struct device_node *endpoint __free(device_node) = NULL;
-		struct device_node *connector_np;
-		struct typec_mux_desc desc = {};
-		const char *name, *mux_name;
-
-		if (dcp->nr_typec_routes == DCP_MAX_TYPEC_ROUTES)
-			return dev_err_probe(dev, -E2BIG, "Too many Type-C display routes\n");
-
+		if (nr == DCP_MAX_TYPEC_ROUTES) {
+			ret = dev_err_probe(dev, -E2BIG, "Too many Type-C display routes\n");
+			goto put;
+		}
 		ret = of_property_read_u32(route_np, "reg", &route_index);
-		if (ret)
-			return dev_err_probe(dev, ret, "%pOF: missing route index\n", route_np);
-		if (route_index >= DCP_MAX_TYPEC_ROUTES)
-			return dev_err_probe(dev, -EINVAL, "%pOF: invalid route index %u\n",
-					     route_np, route_index);
-
-		name = devm_kasprintf(dev, GFP_KERNEL, "typec%u", route_index);
-		if (!name)
-			return -ENOMEM;
-
-		/*
-		 * The DT lookups above are per-DCP, but the typec_mux class is
-		 * global. Several DCPs can offer a route to the same Type-C port,
-		 * so the registered mux needs a name unique across all of them.
-		 */
-		mux_name = devm_kasprintf(dev, GFP_KERNEL, "%s-typec%u",
-					  dev_name(dev), route_index);
-		if (!mux_name)
-			return -ENOMEM;
-
-		route = &dcp->typec_routes[dcp->nr_typec_routes];
-		route->dcp = dcp;
-		INIT_LIST_HEAD(&route->port_link);
-		route->phy = devm_phy_get(dev, name);
-		if (IS_ERR(route->phy))
-			return dev_err_probe(dev, PTR_ERR(route->phy),
-					     "%pOF: failed to get DP PHY\n", route_np);
-
-		route->xbar = devm_mux_control_get(dev, name);
-		if (IS_ERR(route->xbar))
-			return dev_err_probe(dev, PTR_ERR(route->xbar),
-					     "%pOF: failed to get display crossbar\n", route_np);
-
-		ret = of_property_read_u32_index(dev->of_node, "apple,typec-mux-indices",
-						 route_index, &route->mux_index);
-		if (ret)
-			return dev_err_probe(dev, ret, "%pOF: missing crossbar state\n",
-					     route_np);
-
-		ret = of_property_read_u32_index(dev->of_node, "apple,typec-dptx-phys",
-						 route_index, &route->dptx_phy);
-		if (ret)
-			return dev_err_probe(dev, ret, "%pOF: missing DPTX PHY index\n",
-					     route_np);
-
-		endpoint = of_graph_get_next_endpoint(route_np, NULL);
-		if (!endpoint)
-			return dev_err_probe(dev, -EINVAL,
-					     "%pOF: missing Type-C graph endpoint\n",
-					     route_np);
-		connector_np = of_graph_get_remote_port_parent(endpoint);
-		if (!connector_np)
-			return dev_err_probe(dev, -EINVAL,
-					     "%pOF: missing Type-C connector\n",
-					     route_np);
-
-		ret = dcp_typec_route_wiring(route, connector_np, route_index);
 		if (ret) {
-			of_node_put(connector_np);
-			return dev_err_probe(dev, ret, "%pOF: invalid DPIN wiring\n", route_np);
+			ret = dev_err_probe(dev, ret, "%pOF: missing route index\n", route_np);
+			goto put;
 		}
-
-		mutex_lock(&dcp_typec_fabric_lock);
-		route->port = dcp_typec_port_get(connector_np);
-		if (route->port) {
-			list_add_tail(&route->port_link, &route->port->routes);
-			if (route->dual_stream)
-				atomic_inc(&dcp_dual_stream_routes);
+		if (route_index >= DCP_MAX_TYPEC_ROUTES || ordered[route_index]) {
+			ret = dev_err_probe(dev, -EINVAL, "%pOF: invalid route index %u\n",
+					    route_np, route_index);
+			goto put;
 		}
-		mutex_unlock(&dcp_typec_fabric_lock);
-		if (!route->port)
-			return -ENOMEM;
-
-		desc.fwnode = of_fwnode_handle(route_np);
-		desc.set = dcp_typec_route_set;
-		desc.name = mux_name;
-		desc.drvdata = route;
-		route->typec_mux = typec_mux_register(dev, &desc);
-		if (IS_ERR(route->typec_mux)) {
-			mutex_lock(&dcp_typec_fabric_lock);
-			list_del(&route->port_link);
-			if (route->dual_stream)
-				atomic_dec(&dcp_dual_stream_routes);
-			if (list_empty(&route->port->routes)) {
-				list_del(&route->port->link);
-				of_node_put(route->port->connector_np);
-				kfree(route->port);
-			}
-			mutex_unlock(&dcp_typec_fabric_lock);
-			return dev_err_probe(dev, PTR_ERR(route->typec_mux),
-					     "%pOF: failed to register Type-C route\n", route_np);
-		}
-
-		ret = devm_add_action_or_reset(dev, dcp_typec_route_unregister, route);
-		if (ret)
-			return ret;
-
-		if (!dcp->phy)
-			dcp->phy = route->phy;
-		dcp->nr_typec_routes++;
+		ordered[route_index] = of_node_get(route_np);
+		nr++;
 	}
+
+	for (i = 0; i < DCP_MAX_TYPEC_ROUTES && !ret; i++)
+		if (ordered[i])
+			ret = dcp_register_one_typec_route(dcp, ordered[i], i);
+put:
+	for (i = 0; i < DCP_MAX_TYPEC_ROUTES; i++)
+		of_node_put(ordered[i]);
+	if (ret)
+		return ret;
 
 	if (!dcp->nr_typec_routes)
 		return dev_err_probe(dev, -EINVAL, "Type-C route container is empty\n");
