@@ -135,6 +135,10 @@ int dptxport_validate_connection(struct apple_epic_service *service, u8 core,
 	 */
 	u32 attrs = 0x100 | (dcp_is_usb4_output(service->ep->dcp) ? 1 : 0);
 
+	/* A T8122 dcpext firmware that stopped answering (dcp_ext_fw_wedge()) */
+	if (dcp_ext_fw_wedged(service->ep->dcp))
+		return -ENODEV;
+
 	trace_dptxport_validate_connection(dptx, core, atc, die);
 	dptx->validate_calls++;
 	dev_dbg(service->ep->dcp->dev,
@@ -146,6 +150,7 @@ int dptxport_validate_connection(struct apple_epic_service *service, u8 core,
 	cmd.unk = cpu_to_le32(attrs);
 	ret = afk_service_call(service, 0, 12, &cmd, sizeof(cmd), 40, &resp,
 			       sizeof(resp), 40);
+	dcp_ext_fw_result(service->ep->dcp, ret, "validate");
 	if (ret)
 		return ret;
 
@@ -182,6 +187,9 @@ int dptxport_connect(struct apple_epic_service *service, u8 core, u8 atc,
 	int ret;
 	u32 target = dptxport_remote_target(service->ep->dcp, core, atc, die);
 
+	if (dcp_ext_fw_wedged(service->ep->dcp))
+		return -ENODEV;
+
 	trace_dptxport_connect(dptx, core, atc, die);
 	dptx->connect_calls++;
 	dev_dbg(service->ep->dcp->dev,
@@ -193,6 +201,7 @@ int dptxport_connect(struct apple_epic_service *service, u8 core, u8 atc,
 	cmd.unk = cpu_to_le32(unk_field);
 	ret = afk_service_call(service, 0, 11, &cmd, sizeof(cmd), 24, &resp,
 			       sizeof(resp), 24);
+	dcp_ext_fw_result(service->ep->dcp, ret, "connect");
 	if (ret)
 		return ret;
 
@@ -214,11 +223,15 @@ int dptxport_request_display(struct apple_epic_service *service)
 	struct dptx_port *dptx = service->cookie;
 	int ret;
 
+	if (dcp_ext_fw_wedged(service->ep->dcp))
+		return -ENODEV;
+
 	dptx->request_calls++;
 	dev_dbg(service->ep->dcp->dev,
 		 "DPTX request_display: call #%u this boot caller=%pS\n",
 		 dptx->request_calls, __builtin_return_address(0));
 	ret = afk_service_call(service, 0, 6, NULL, 0, 16, NULL, 0, 16);
+	dcp_ext_fw_result(service->ep->dcp, ret, "request_display");
 	dev_dbg(service->ep->dcp->dev,
 		 "DPTX request_display: call #%u result=%d\n",
 		 dptx->request_calls, ret);
@@ -230,11 +243,16 @@ int dptxport_release_display(struct apple_epic_service *service)
 	struct dptx_port *dptx = service->cookie;
 	int ret;
 
+	/* Nothing to release in a firmware that stopped answering. */
+	if (dcp_ext_fw_wedged(service->ep->dcp))
+		return 0;
+
 	dptx->release_calls++;
 	dev_dbg(service->ep->dcp->dev,
 		 "DPTX release_display: call #%u this boot caller=%pS\n",
 		 dptx->release_calls, __builtin_return_address(0));
 	ret = afk_service_call(service, 0, 7, NULL, 0, 16, NULL, 0, 16);
+	dcp_ext_fw_result(service->ep->dcp, ret, "release_display");
 	dev_dbg(service->ep->dcp->dev,
 		 "DPTX release_display: call #%u result=%d\n",
 		 dptx->release_calls, ret);
@@ -247,6 +265,10 @@ int dptxport_set_hpd_timeout(struct apple_epic_service *service, bool hpd,
 	struct dcpdptx_hotplug_cmd cmd, resp;
 	int ret;
 
+	/* A firmware that stopped answering: deasserting is moot. */
+	if (dcp_ext_fw_wedged(service->ep->dcp))
+		return hpd ? -ENODEV : 0;
+
 	memset(&cmd, 0, sizeof(cmd));
 
 	if (hpd)
@@ -254,6 +276,7 @@ int dptxport_set_hpd_timeout(struct apple_epic_service *service, bool hpd,
 
 	ret = afk_service_call_timeout(service, 8, 8, &cmd, sizeof(cmd), 12,
 				       &resp, sizeof(resp), 12, timeout_ms);
+	dcp_ext_fw_result(service->ep->dcp, ret, hpd ? "HPD assert" : "HPD deassert");
 	if (ret)
 		return ret;
 	if (le32_to_cpu(resp.unk) != hpd) {
@@ -273,6 +296,8 @@ int dptxport_set_hpd(struct apple_epic_service *service, bool hpd)
 /* The sink raised IRQ_HPD: the firmware services the request as a DP source. */
 int dptxport_sink_irq(struct apple_epic_service *service)
 {
+	if (dcp_ext_fw_wedged(service->ep->dcp))
+		return -ENODEV;
 	return afk_service_call(service, 8, 9, NULL, 0, 16, NULL, 0, 16);
 }
 

@@ -515,6 +515,9 @@ static int dcp_dptx_connect_session(struct apple_dcp *dcp, u32 port,
 	/* The T8122 flap guard holds the link down; it connects it later. */
 	if (dcp_ext_flap_parked(dcp))
 		return -EBUSY;
+	/* A T8122 dcpext firmware that stopped answering gets no requests. */
+	if (dcp_ext_fw_wedged(dcp))
+		return -ENODEV;
 	/* @port selects the upstream RemotePort service/core. dptx_dfp_port
 	 * is the downstream address: dpphy=0, dpin0=1, dpin1=2.
 	 */
@@ -1029,6 +1032,9 @@ static void dcp_typec_reconnect_work(struct work_struct *work)
 	/* No retries while the T8122 flap guard holds the link down. */
 	if (ret == -EBUSY && dcp_ext_flap_parked(dcp))
 		return;
+	/* nor once the T8122 dcpext firmware stopped answering */
+	if (dcp_ext_fw_wedged(dcp))
+		return;
 	guard(mutex)(&dcp->hpd_mutex);
 	if (!dcp_session_valid_locked(dcp, session, true))
 		return;
@@ -1135,6 +1141,66 @@ static bool dcp_ext_flap_guarded(const struct apple_dcp *dcp)
 bool dcp_ext_flap_parked(struct apple_dcp *dcp)
 {
 	return dcp_ext_flap_guarded(dcp) && READ_ONCE(dcp->ext_flap.parked);
+}
+
+/*
+ * T8122 dcpext firmware that stopped answering (DCP_FIRMWARE_V_14_7_TEMPLATE
+ * only). Seen after a modeset that timed out: from then on every DPTX
+ * request timed out after 1 s, and the USB-C controller kept asking for the
+ * display to be released on each port change (one HPD deassert attempt every
+ * 2 s, minutes long). Once wedged, nothing is sent to that firmware any more:
+ * HPD deasserts and display releases succeed locally (the firmware holds
+ * nothing the port could wait for), connects and modesets fail at once, the
+ * connector is reported disconnected and firmware hotplug is ignored. Only a
+ * new bind (reboot) clears it. The internal display is not involved.
+ */
+bool dcp_ext_fw_wedged(struct apple_dcp *dcp)
+{
+	return dcp_ext_flap_guarded(dcp) && atomic_read(&dcp->ext_fw_wedged);
+}
+
+void dcp_ext_fw_wedge(struct apple_dcp *dcp, const char *why)
+{
+	struct apple_connector *connector = dcp->connector;
+
+	if (!dcp_ext_flap_guarded(dcp) || atomic_xchg(&dcp->ext_fw_wedged, 1))
+		return;
+	dev_err(dcp->dev,
+		"external display firmware not responding (%s): no further requests to it until the next boot; the internal display is not affected\n",
+		why);
+	cancel_delayed_work(&dcp->typec_reconnect_wq);
+	cancel_delayed_work(&dcp->placeholder_edid_wq);
+	cancel_delayed_work(&dcp->swap_watchdog_wq);
+	dcp_mode_invalidate(&dcp->mode_state);
+	if (connector) {
+		apple_connector_edid_set_live(connector, false);
+		if (READ_ONCE(connector->connected)) {
+			WRITE_ONCE(connector->connected, 0);
+			dcp_queue_hotplug(connector);
+		}
+	}
+}
+
+/* The result of a DPTX request to a T8122 dcpext firmware. */
+void dcp_ext_fw_result(struct apple_dcp *dcp, int ret, const char *what)
+{
+	char why[64];
+	int n;
+
+	if (!dcp_ext_flap_guarded(dcp))
+		return;
+	if (!ret) {
+		atomic_set(&dcp->ext_fw_timeouts, 0);
+		return;
+	}
+	if (ret != -ETIMEDOUT)
+		return;
+	n = atomic_inc_return(&dcp->ext_fw_timeouts);
+	if (n < DCP_EXT_FW_TIMEOUTS)
+		return;
+	snprintf(why, sizeof(why), "%d DPTX requests in a row timed out, the last %s", n,
+		 what);
+	dcp_ext_fw_wedge(dcp, why);
 }
 
 /*
@@ -1545,6 +1611,9 @@ int dcp_start(struct platform_device *pdev)
 
 static void _dcp_poweroff(struct apple_dcp *dcp)
 {
+	/* Each call would only wait for its timeout. */
+	if (dcp_ext_fw_wedged(dcp))
+		return;
 	switch (dcp->fw_compat) {
 	case DCP_FIRMWARE_V_12_3:
 		iomfb_poweroff_v12_3(dcp);
@@ -1683,6 +1752,10 @@ void dcp_poweron(struct platform_device *pdev)
 	unsigned long remaining;
 	int ret;
 
+	if (dcp_ext_fw_wedged(dcp)) {
+		dev_dbg(dcp->dev, "%s: firmware not responding, skipped\n", __func__);
+		return;
+	}
 	if (dcp_is_typec_output(dcp)) {
 		wait_for_typec_hpd = READ_ONCE(dcp->typec_crtc_off) &&
 				    READ_ONCE(dcp->typec_cable_connected);

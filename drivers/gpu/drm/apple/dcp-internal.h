@@ -184,6 +184,14 @@ struct apple_dcp {
 		struct delayed_work resume_work;
 	} ext_flap;
 	/*
+	 * T8122 dcpext firmware that stopped answering (a modeset timeout or
+	 * DCP_EXT_FW_TIMEOUTS DPTX request timeouts in a row): no further
+	 * requests are sent to it until the device is bound again, see
+	 * dcp_ext_fw_wedge(). Only the DCP_FIRMWARE_V_14_7_TEMPLATE pipe sets it.
+	 */
+	atomic_t ext_fw_wedged;
+	atomic_t ext_fw_timeouts;
+	/*
 	 * A T6030 external processor in the main DRM device: the kernel starts
 	 * its firmware on first use, its modes come from the attached display.
 	 * Clear for the manual diagnostic path (separate scanout, explicit start).
@@ -462,6 +470,11 @@ bool dcp_has_panel(struct apple_dcp *dcp);
 
 bool dcp_ext_flap_filter(struct apple_dcp *dcp, bool connected);
 bool dcp_ext_flap_parked(struct apple_dcp *dcp);
+
+#define DCP_EXT_FW_TIMEOUTS 3
+bool dcp_ext_fw_wedged(struct apple_dcp *dcp);
+void dcp_ext_fw_wedge(struct apple_dcp *dcp, const char *why);
+void dcp_ext_fw_result(struct apple_dcp *dcp, int ret, const char *what);
 
 /*
  * Does @dcp run 14.7 firmware, whichever IOMFB path drives it? For the

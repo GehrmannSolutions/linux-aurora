@@ -1085,6 +1085,9 @@ static void dcpep_cb_hotplug(struct apple_dcp *dcp, u64 *connected)
 	 */
 	if (dcp->main_display)
 		return;
+	/* A T8122 dcpext that stopped answering stays disconnected. */
+	if (dcp_ext_fw_wedged(dcp))
+		return;
 	/*
 	 * Report firmware hotplug independently of the USB4 PHY experiment.
 	 * Reassigning lpdptxphy blanked eDP even with these callbacks ignored;
@@ -1337,6 +1340,10 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	struct dcp_color_mode *cmode = NULL;
 	int ret;
 
+	/* Its firmware stopped answering: the wait below would only time out. */
+	if (dcp_ext_fw_wedged(dcp))
+		return -EIO;
+
 	if (!lookup_mode(dcp, &crtc_state->mode, mode)) {
 		dev_err(dcp->dev, "no match for " DRM_MODE_FMT "\n",
 			DRM_MODE_ARG(&crtc_state->mode));
@@ -1403,6 +1410,11 @@ int DCP_FW_NAME(iomfb_modeset)(struct apple_dcp *dcp,
 	if (ret == 0) {
 		dev_info(dcp->dev, "set_digital_out_mode timed out\n");
 		kref_put(&cookie->refcount, release_wait_cookie);
+		/*
+		 * T8122 dcpext: a firmware that misses this deadline has not
+		 * answered anything afterwards; stop sending it requests.
+		 */
+		dcp_ext_fw_wedge(dcp, "set_digital_out_mode timed out");
 		return -EIO;
 	} else if (ret < 0) {
 		dev_info(dcp->dev,
