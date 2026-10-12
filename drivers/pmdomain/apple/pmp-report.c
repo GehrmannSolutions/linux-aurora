@@ -63,6 +63,8 @@ struct apple_pmp_report {
 	u64 ack;
 	/* Requests that must be acknowledged before any consumer can proceed. */
 	u64 startup_ack;
+	/* Seeded bits that are soc-device record indices (apple,soc-device-record). */
+	u64 record_seed;
 	struct of_changeset pmp_cs;
 	struct work_struct start_work;
 	/* The requests are in place; the first consumer starts the PMP. */
@@ -78,6 +80,38 @@ struct apple_pmp_report {
 
 /* Serializes M3 publication, startup requests and waiter references. */
 static DEFINE_MUTEX(apple_pmp_report_mutex);
+
+/*
+ * The PTD request/acknowledge bit of a report entry. An entry's reg is its
+ * soc-device ID - 1. An entry marked apple,soc-device-record is requested by
+ * soc-device record instead: some PMP firmware (T8122) reads the request
+ * word as one bit per record of its apple,tunable-soc-device table, whose
+ * records are not in ID order, so the bit is the index of the record that
+ * holds that ID.
+ */
+static int apple_pmp_report_bit(const struct apple_pmp_report *rep,
+				struct device_node *entry, u32 *bit, bool *record)
+{
+	const u8 *table;
+	int len = 0, index;
+	u32 reg;
+
+	if (of_property_read_u32(entry, "reg", &reg) || reg > 63)
+		return -EINVAL;
+	*record = of_property_read_bool(entry, "apple,soc-device-record");
+	if (!*record) {
+		*bit = reg;
+		return 0;
+	}
+	if (!rep->offsets->starts_pmp || !rep->pmp)
+		return -EINVAL;
+	table = of_get_property(rep->pmp, "apple,tunable-soc-device", &len);
+	index = apple_pmp_record_of_id(table, len > 0 ? len : 0, reg + 1);
+	if (index < 0 || index > 63)
+		return -ENOENT;
+	*bit = index;
+	return 0;
+}
 
 
 static umode_t apple_pmp_temp_is_visible(const void *data,
@@ -361,8 +395,13 @@ static int apple_pmp_t6030_check_layout(struct apple_pmp_report *rep)
 		return -EINVAL;
 
 	table = of_get_property(rep->pmp, "apple,tunable-soc-device", &len);
-	if (!apple_pmp_devices_valid(table, len, rep->seed, rep->ack,
+	if (!apple_pmp_devices_valid(table, len, rep->seed & ~rep->record_seed,
+				     rep->ack & ~rep->record_seed,
 				     rep->offsets->devices_ordered))
+		return -EINVAL;
+	if (rep->record_seed &&
+	    !apple_pmp_records_valid(table, len, rep->record_seed,
+				     rep->ack & rep->record_seed))
 		return -EINVAL;
 	return 0;
 }
@@ -406,9 +445,21 @@ static int apple_pmp_t6030_check(struct apple_pmp_report *rep)
 
 	/* 3: the requests this driver seeds, and a PTD with nothing else in it */
 	for_each_available_child_of_node(np, child) {
-		if (!of_property_read_bool(child, "apple,always-on") ||
-		    of_property_read_u32(child, "reg", &id) || id > 63)
+		bool record;
+
+		if (!of_property_read_bool(child, "apple,always-on"))
 			continue;
+		ret = apple_pmp_report_bit(rep, child, &id, &record);
+		if (ret == -EINVAL)
+			continue;
+		if (ret || (rep->seed & BIT_ULL(id))) {
+			of_node_put(child);
+			return dev_err_probe(rep->dev, -EINVAL,
+					     "%s PMP not started: no unique request bit for %pOF\n",
+					     rep->offsets->name, child);
+		}
+		if (record)
+			rep->record_seed |= BIT_ULL(id);
 		rep->seed |= BIT_ULL(id);
 		if (!of_property_read_bool(child, "apple,no-ack")) {
 			rep->ack |= BIT_ULL(id);
@@ -436,6 +487,9 @@ static int apple_pmp_t6030_check(struct apple_pmp_report *rep)
 	dev_info(rep->dev,
 		 "PMP halted, firmware %pUb; PTD status %#llx request %#llx ack %#llx; requesting %#llx\n",
 		 &image, status, request, ack, rep->seed);
+	if (rep->record_seed)
+		dev_info(rep->dev, "request bits %#llx are soc-device records\n",
+			 rep->record_seed);
 	return 0;
 }
 
@@ -876,6 +930,7 @@ int apple_pmp_report_wait_ready(struct device_node *entry, unsigned long timeout
 	struct platform_device *pdev;
 	struct apple_pmp_report *rep;
 	u64 status, ack;
+	bool record;
 	u32 id;
 	int ret;
 
@@ -905,7 +960,8 @@ int apple_pmp_report_wait_ready(struct device_node *entry, unsigned long timeout
 			ret = -ENODEV;
 			goto out_put;
 		}
-		if (!rep->offsets->starts_pmp) {
+		if (!rep->offsets->starts_pmp ||
+		    apple_pmp_report_bit(rep, entry, &id, &record)) {
 			ret = -EINVAL;
 			goto out_put;
 		}
@@ -1237,6 +1293,7 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 	struct device_node *node = dev->of_node;
 	struct apple_pmp_report_entry *ent;
 	int ret;
+	bool record;
 	const char *name;
 	struct of_phandle_iterator it;
 
@@ -1246,9 +1303,9 @@ static int apple_pmp_report_entry_probe(struct platform_device *pdev)
 
 	ent->dev = dev;
 
-	ret = of_property_read_u32(node, "reg", &ent->id);
+	ret = apple_pmp_report_bit(dev_get_drvdata(dev->parent), node, &ent->id, &record);
 	if (ret)
-		return dev_err_probe(dev, ret, "missing reg property\n");
+		return dev_err_probe(dev, ret, "no request bit (reg, soc-device record)\n");
 
 	ret = of_property_read_string(node, "label", &name);
 	if (ret < 0)

@@ -11,10 +11,19 @@
  * apple,dram-vendor-id and every apple,tunable-* value, including
  * apple,tunable-uuid).
  *
- * The report seeds the display request (DISP, soc-device id 8, request bit
- * 7) and the storage request (ANS, soc-device id 18, request bit 17). The
- * PMP, its DART and its mailbox stay disabled here; the PMP report driver
- * starts the PMP when the display driver first asks for it.
+ * The report seeds the display request (DISP, soc-device id 8) and the
+ * storage request (ANS, soc-device id 18). The PMP, its DART and its
+ * mailbox stay disabled here; the PMP report driver starts the PMP when the
+ * display driver first asks for it.
+ *
+ * Report entries are numbered by soc-device id - 1 (reg). The T8122 PMP
+ * firmware, however, reads the PTD request word as one bit per record of
+ * its apple,tunable-soc-device table, and on T8122 the records are not in
+ * id order (on J613: record 7 is PACC0, 11 DISP, 17 SCODEC, 19 ANS). An
+ * entry marked apple,soc-device-record is therefore requested at the index
+ * of the record that holds its id; the report driver looks it up in the
+ * table. The ANS entry is not marked yet: its request bit 17 still names
+ * record 17, not ANS, as before.
  */
 
 /dts-v1/;
@@ -46,6 +55,7 @@
 					label = "pmp-disp";
 					#power-domain-cells = <0>;
 					apple,always-on;
+					apple,soc-device-record;
 					phandle = <0x100>;
 				};
 
