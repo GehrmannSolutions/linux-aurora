@@ -59,6 +59,7 @@
 #include <linux/memblock.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/of_graph.h>
 #include <linux/of_reserved_mem.h>
 #include <linux/printk.h>
 #include <linux/slab.h>
@@ -1296,13 +1297,407 @@ static bool __init gate_available(struct device_node *np)
 	return np && of_device_is_available(np);
 }
 
+/*
+ * J613: also give the dcpext a Type-C route to the second USB-C port
+ * (left-front, ATC1). The device tree only wires the left-back port
+ * (route@0: ATC0's DP PHY and crossbar, crossbar state 2 = dispext1,0,
+ * DPTX target 0) and leaves ATC1's crossbar disabled, so on the front port
+ * the USB-C controller finds no display mode switch, and only USB comes
+ * up. The gate adds, in the same changeset that enables the dcpext:
+ *  - typec-routes/route@1 (mode-switch) with an endpoint, and port@3 with
+ *    the matching endpoint on the front connector, as the device tree does
+ *    for route@0 and typec0;
+ *  - ATC1's DP PHY and crossbar to the dcpext's phys / mux-controls
+ *    ("typec1"), the same crossbar state as route 0 (one display pipeline,
+ *    dispext1,0, behind either port's crossbar), and DPTX target 1 (the
+ *    firmware's DFP index of atc1, as in the M1/M2 dcpext routes);
+ *  - status = "okay" on ATC1's crossbar, and apple,always-on on ATC1's
+ *    common power state if ATC0's has it (as the device tree does for ATC0).
+ * The dcpext has one DPTX link, so one external display at a time: the
+ * display fabric gives the pipeline to the first port that asks; the other
+ * port's display mode switch then reports busy, and its USB keeps working.
+ * Everything is found through the device tree (the route@0 graph, the
+ * connector whose SuperSpeed lanes go to the other ATC PHY, the crossbar at
+ * that PHY's base + 0x4c000) and checked first; if anything does not match,
+ * or the device tree already describes a second route, the front port is
+ * left as it is and the dcpext is enabled with the routes it has.
+ */
+
+#define GATE_ATC_XBAR_OFFSET	0x4c000
+
+struct gate_front {
+	struct device_node *routes;	/* the dcpext's typec-routes */
+	struct device_node *phy0, *phy1;	/* ATC0 / ATC1 PHY */
+	struct device_node *xbar0, *xbar1;	/* their display crossbars */
+	struct device_node *conn1;	/* the front connector */
+	struct device_node *ports1;	/* its ports node */
+	struct device_node *common1;	/* ATC1 common power state, if to be kept on */
+	u32 phy_cell, mux_index, dptx;
+	phandle route_ph, conn_ph, xbar_ph;
+	bool xbar_new_ph;	/* nothing in the DTB refers to ATC1's crossbar */
+	struct device_node *route_ep, *conn_ep;	/* created by the changeset */
+};
+
+static void __init gate_front_put(struct gate_front *f)
+{
+	of_node_put(f->routes);
+	of_node_put(f->phy0);
+	of_node_put(f->phy1);
+	of_node_put(f->xbar0);
+	of_node_put(f->xbar1);
+	of_node_put(f->conn1);
+	of_node_put(f->ports1);
+	of_node_put(f->common1);
+}
+
+/* The remote port parent of @node's first endpoint in port @port_id. */
+static struct device_node *__init gate_graph_remote(const struct device_node *node,
+						    int port_id)
+{
+	struct device_node *ep, *remote;
+
+	ep = of_graph_get_endpoint_by_regs(node, port_id, -1);
+	if (!ep)
+		return NULL;
+	remote = of_graph_get_remote_port_parent(ep);
+	of_node_put(ep);
+	return remote;
+}
+
+static bool __init gate_reg_start(struct device_node *np, resource_size_t *start)
+{
+	struct resource res;
+
+	if (of_address_to_resource(np, 0, &res))
+		return false;
+	*start = res.start;
+	return true;
+}
+
+/* @xbar is the display crossbar of the ATC whose PHY is @phy. */
+static bool __init gate_xbar_of_phy(struct device_node *xbar, struct device_node *phy)
+{
+	resource_size_t x, p;
+
+	return of_device_is_compatible(xbar, "apple,t8122-display-crossbar") &&
+	       gate_reg_start(xbar, &x) && gate_reg_start(phy, &p) &&
+	       x == p + GATE_ATC_XBAR_OFFSET;
+}
+
+/* The "atcN_common" power state that @phy's power domain depends on. */
+static struct device_node *__init gate_atc_common(struct device_node *phy)
+{
+	struct device_node *ps, *parent, *found = NULL;
+	const char *label;
+	int i;
+
+	ps = of_parse_phandle(phy, "power-domains", 0);
+	if (!ps)
+		return NULL;
+	for (i = 0; !found && (parent = of_parse_phandle(ps, "power-domains", i)); i++) {
+		if (!of_property_read_string(parent, "label", &label) &&
+		    strlen(label) > 7 && !strcmp(label + strlen(label) - 7, "_common"))
+			found = parent;
+		else
+			of_node_put(parent);
+	}
+	of_node_put(ps);
+	return found;
+}
+
+static bool __init gate_one_string(struct device_node *np, const char *list, const char *want)
+{
+	const char *s;
+
+	return of_property_count_strings(np, list) == 1 &&
+	       !of_property_read_string_index(np, list, 0, &s) && !strcmp(s, want);
+}
+
+/* The largest phandle in the live tree. */
+static phandle __init gate_max_phandle(void)
+{
+	struct device_node *np;
+	phandle max = 0;
+
+	for (np = of_find_all_nodes(NULL); np; np = of_find_all_nodes(np))
+		if (np->phandle != 0xdeadbeef && np->phandle > max)
+			max = np->phandle;
+	return max;
+}
+
+/* Checks everything the front-port route needs; returns why not, or NULL. */
+static const char *__init gate_front_resolve(struct device_node *dcp, struct gate_front *f)
+{
+	struct device_node *child, *conn0 = NULL, *c, *remote, *common0, *port;
+	struct of_phandle_args args;
+	u32 val, reg, cells;
+	int n = 0;
+
+	if (!of_machine_is_compatible("apple,j613"))
+		return "not a J613";
+	f->routes = of_get_child_by_name(dcp, "typec-routes");
+	if (!f->routes)
+		return "the dcpext has no typec-routes";
+	for_each_child_of_node(f->routes, child) {
+		if (of_property_read_u32(child, "reg", &reg) || reg != 0 || n++) {
+			of_node_put(child);
+			of_node_put(conn0);
+			return "the dcpext has a Type-C route other than route@0";
+		}
+		conn0 = gate_graph_remote(child, -1);
+	}
+	if (!conn0)
+		return "route@0 has no Type-C connector";
+
+	/* route 0: exactly the DTB's single-port wiring */
+	if (of_count_phandle_with_args(dcp, "phys", "#phy-cells") != 1 ||
+	    of_parse_phandle_with_args(dcp, "phys", "#phy-cells", 0, &args))
+		goto wiring;
+	f->phy0 = args.np;
+	if (args.args_count != 1 || !of_device_is_compatible(f->phy0, "apple,t8122-atcphy"))
+		goto wiring;
+	f->phy_cell = args.args[0];
+	if (of_count_phandle_with_args(dcp, "mux-controls", "#mux-control-cells") != 1 ||
+	    of_parse_phandle_with_args(dcp, "mux-controls", "#mux-control-cells", 0, &args))
+		goto wiring;
+	f->xbar0 = args.np;
+	if (args.args_count != 1 || args.args[0] != 0 || !gate_xbar_of_phy(f->xbar0, f->phy0))
+		goto wiring;
+	if (!gate_one_string(dcp, "phy-names", "typec0") ||
+	    !gate_one_string(dcp, "mux-control-names", "typec0") ||
+	    of_property_count_u32_elems(dcp, "apple,typec-mux-indices") != 1 ||
+	    of_property_read_u32(dcp, "apple,typec-mux-indices", &f->mux_index) ||
+	    of_property_count_u32_elems(dcp, "apple,typec-dptx-phys") != 1 ||
+	    of_property_read_u32(dcp, "apple,typec-dptx-phys", &val) || val != 0)
+		goto wiring;
+	remote = gate_graph_remote(conn0, 1);
+	of_node_put(remote);
+	if (remote != f->phy0)
+		goto wiring;
+	of_node_put(conn0);
+	conn0 = NULL;
+
+	/* the one other connector whose SuperSpeed lanes go to another ATC PHY */
+	for_each_compatible_node(c, NULL, "usb-c-connector") {
+		if (!of_device_is_available(c->parent))
+			continue;
+		remote = gate_graph_remote(c, 1);
+		if (remote && remote != f->phy0 &&
+		    of_device_is_compatible(remote, "apple,t8122-atcphy")) {
+			if (f->conn1) {
+				of_node_put(remote);
+				of_node_put(c);
+				return "more than one other USB-C connector";
+			}
+			f->conn1 = of_node_get(c);
+			f->phy1 = remote;
+		} else {
+			of_node_put(remote);
+		}
+	}
+	if (!f->conn1)
+		return "no other USB-C connector on an ATC PHY";
+	port = of_graph_get_port_by_id(f->conn1, 3);
+	of_node_put(port);
+	if (port)
+		return "the front connector already has a display port (port@3)";
+	f->ports1 = of_get_child_by_name(f->conn1, "ports");
+	if (!f->ports1 || of_property_read_u32(f->ports1, "#address-cells", &cells) ||
+	    cells != 1 || of_property_read_u32(f->ports1, "#size-cells", &cells) || cells)
+		return "the front connector has no usable ports node";
+	if (!of_device_is_available(f->phy1))
+		return "the front ATC PHY is disabled";
+	if (of_property_count_u32_elems(f->phy1, "apple,tunable-common") <= 0)
+		return "the front ATC PHY has no DisplayPort tunables";
+
+	for_each_compatible_node(c, NULL, "apple,t8122-display-crossbar") {
+		if (gate_xbar_of_phy(c, f->phy1)) {
+			f->xbar1 = of_node_get(c);
+			of_node_put(c);
+			break;
+		}
+	}
+	if (!f->xbar1)
+		return "the front ATC has no display crossbar";
+	if (f->xbar1 == f->xbar0)
+		return "both ports share one crossbar";
+	{
+		struct device_node *a = of_parse_phandle(f->xbar1, "power-domains", 0);
+		struct device_node *b = of_parse_phandle(f->phy1, "power-domains", 0);
+
+		of_node_put(a);
+		of_node_put(b);
+		if (!a || a != b)
+			return "the front crossbar is not in its ATC's power domain";
+	}
+
+	/* keep ATC1 common on exactly when ATC0 common is (DP alt mode) */
+	common0 = gate_atc_common(f->phy0);
+	if (common0 && of_property_read_bool(common0, "apple,always-on")) {
+		f->common1 = gate_atc_common(f->phy1);
+		if (f->common1 && (f->common1 == common0 ||
+				   of_property_read_bool(f->common1, "apple,always-on"))) {
+			of_node_put(f->common1);
+			f->common1 = NULL;
+		}
+	}
+	of_node_put(common0);
+
+	if (!f->phy0->phandle || !f->phy1->phandle || !f->xbar0->phandle)
+		return "an ATC PHY or crossbar has no phandle";
+
+	f->dptx = 1;
+	f->route_ph = gate_max_phandle() + 1;
+	f->conn_ph = f->route_ph + 1;
+	/* dtc gives a node a phandle only if something refers to it */
+	f->xbar_new_ph = !f->xbar1->phandle;
+	f->xbar_ph = f->xbar_new_ph ? f->route_ph + 2 : f->xbar1->phandle;
+	if (f->route_ph < 2 || f->route_ph + 2 >= 0xdeadbeef)
+		return "no free phandles";
+	return NULL;
+
+wiring:
+	of_node_put(conn0);
+	return "the dcpext's Type-C wiring is not the DTB's single left-back route";
+}
+
+/* Sets @np's property @name to a copy of @len bytes at @val. */
+static int __init gate_set_raw(struct of_changeset *cs, struct device_node *np,
+			       const char *name, const void *val, int len)
+{
+	struct property *prop = kzalloc_obj(*prop);
+	void *value = kmemdup(val, len, GFP_KERNEL);
+
+	if (!prop || !value) {
+		kfree(prop);
+		kfree(value);
+		return -ENOMEM;
+	}
+	prop->name = (char *)name;
+	prop->length = len;
+	prop->value = value;
+	/* adds the property if @np does not have it yet */
+	return of_changeset_update_property(cs, np, prop);
+}
+
+static int __init gate_set_u32s(struct of_changeset *cs, struct device_node *np,
+				const char *name, const u32 *vals, int n)
+{
+	__be32 be[4];
+	int i;
+
+	for (i = 0; i < n && i < ARRAY_SIZE(be); i++)
+		be[i] = cpu_to_be32(vals[i]);
+	return gate_set_raw(cs, np, name, be, i * sizeof(*be));
+}
+
+/* An endpoint node under @parent/@port_name, pointing at @remote_ph. */
+static struct device_node *__init gate_front_endpoint(struct of_changeset *cs,
+						      struct device_node *port,
+						      phandle ph, phandle remote_ph)
+{
+	struct device_node *ep = of_changeset_create_node(cs, port, "endpoint");
+
+	if (!ep)
+		return NULL;
+	if (of_changeset_add_prop_u32(cs, ep, "phandle", ph) ||
+	    of_changeset_add_prop_u32(cs, ep, "remote-endpoint", remote_ph))
+		return NULL;
+	return ep;
+}
+
+/* Adds the front-port route (see above) to @cs. */
+static int __init gate_front_add(struct of_changeset *cs, struct device_node *dcp,
+				 struct gate_front *f)
+{
+	static const char names[] = "typec0\0typec1";
+	struct device_node *route, *port;
+	u32 v[4];
+	int ret;
+
+	v[0] = f->phy0->phandle;
+	v[1] = f->phy_cell;
+	v[2] = f->phy1->phandle;
+	v[3] = f->phy_cell;
+	ret = gate_set_u32s(cs, dcp, "phys", v, 4);
+	if (!ret)
+		ret = gate_set_raw(cs, dcp, "phy-names", names, sizeof(names));
+	v[0] = f->xbar0->phandle;
+	v[1] = 0;
+	v[2] = f->xbar_ph;
+	v[3] = 0;
+	if (!ret)
+		ret = gate_set_u32s(cs, dcp, "mux-controls", v, 4);
+	if (!ret)
+		ret = gate_set_raw(cs, dcp, "mux-control-names", names, sizeof(names));
+	v[0] = f->mux_index;
+	v[1] = f->mux_index;
+	if (!ret)
+		ret = gate_set_u32s(cs, dcp, "apple,typec-mux-indices", v, 2);
+	v[0] = 0;
+	v[1] = f->dptx;
+	if (!ret)
+		ret = gate_set_u32s(cs, dcp, "apple,typec-dptx-phys", v, 2);
+	if (!ret && f->xbar_new_ph)
+		ret = of_changeset_add_prop_u32(cs, f->xbar1, "phandle", f->xbar_ph);
+	if (!ret && gate_disabled(f->xbar1))
+		ret = of_changeset_update_prop_string(cs, f->xbar1, "status", "okay");
+	if (!ret && f->common1)
+		ret = of_changeset_add_prop_bool(cs, f->common1, "apple,always-on");
+	if (ret)
+		return ret;
+
+	/* The new nodes are kept for good, like the changeset that attaches them. */
+	route = of_changeset_create_node(cs, f->routes, "route@1");
+	if (!route)
+		return -ENOMEM;
+	ret = of_changeset_add_prop_u32(cs, route, "reg", 1);
+	if (!ret)
+		ret = of_changeset_add_prop_bool(cs, route, "mode-switch");
+	/* usable exactly when the dcpext is, which this changeset enables */
+	if (!ret)
+		ret = of_changeset_add_prop_string(cs, route, "status", "okay");
+	if (ret)
+		return ret;
+	port = of_changeset_create_node(cs, route, "port");
+	if (!port)
+		return -ENOMEM;
+	f->route_ep = gate_front_endpoint(cs, port, f->route_ph, f->conn_ph);
+	if (!f->route_ep)
+		return -ENOMEM;
+
+	port = of_changeset_create_node(cs, f->ports1, "port@3");
+	if (!port || of_changeset_add_prop_u32(cs, port, "reg", 3))
+		return -ENOMEM;
+	f->conn_ep = gate_front_endpoint(cs, port, f->conn_ph, f->route_ph);
+	if (!f->conn_ep)
+		return -ENOMEM;
+	return 0;
+}
+
+/*
+ * After the changeset is applied: a node takes its phandle from its
+ * "phandle" property only when it is attached (from the FDT, or by a
+ * changeset, which adds properties after the node), so the new endpoints
+ * and the crossbar, which had none, do not have them yet. Set them now,
+ * before anything can look them up (no devices exist yet).
+ */
+static void __init gate_front_applied(struct gate_front *f)
+{
+	f->route_ep->phandle = f->route_ph;
+	f->conn_ep->phandle = f->conn_ph;
+	if (f->xbar_new_ph)
+		f->xbar1->phandle = f->xbar_ph;
+}
+
 static void __init gate_t8122_dcpext_one(struct device_node *np)
 {
 	struct device_node *dart = NULL, *mbox = NULL, *piodma = NULL;
 	struct device_node *disp_dart = NULL, *ps = NULL, *entry = NULL;
+	struct gate_front front = {};
 	struct of_changeset *cs;
-	const char *label, *pmp_note;
-	bool pmp_request = false;
+	const char *label, *pmp_note, *front_why;
+	bool pmp_request = false, with_front = false;
 	u32 ready;
 	int ret;
 
@@ -1354,6 +1749,13 @@ static void __init gate_t8122_dcpext_one(struct device_node *np)
 		pmp_note = "PMP DISPEXT request";
 	}
 
+	/* The front-port route, if everything it needs checks out. */
+	front_why = gate_front_resolve(np, &front);
+	if (front_why)
+		gate_info("%pOF: no added route to the front USB-C port: %s\n", np, front_why);
+	else
+		with_front = true;
+
 	cs = gate_cs_alloc();
 	if (!cs) {
 		gate_ext_refuse(np, "out of memory");
@@ -1370,6 +1772,8 @@ static void __init gate_t8122_dcpext_one(struct device_node *np)
 		ret = of_changeset_update_prop_string(cs, np, "status", "okay");
 	if (!ret)
 		ret = gate_ext_routes(cs, np, "okay");
+	if (!ret && with_front)
+		ret = gate_front_add(cs, np, &front);
 	if (!ret)
 		ret = gate_display_add_dart(cs, disp_dart);
 	if (!ret)
@@ -1380,9 +1784,16 @@ static void __init gate_t8122_dcpext_one(struct device_node *np)
 		gate_ext_refuse(np, "the gate could not enable it");
 		goto put;
 	}
+	if (with_front)
+		gate_front_applied(&front);
 	gate_info("enabled %pOF with its Type-C routes, display DART %pOF, CPU power floor and %s; started by the display driver\n",
 		  np, disp_dart, pmp_note);
+	if (with_front)
+		gate_info("%pOF: Type-C route 1 to the front port %pOF: DP PHY %pOF, crossbar %pOF (state %u), DPTX target %u%s\n",
+			  np, front.conn1, front.phy1, front.xbar1, front.mux_index, front.dptx,
+			  front.common1 ? ", ATC1 common power kept on" : "");
 put:
+	gate_front_put(&front);
 	of_node_put(entry);
 	of_node_put(ps);
 	of_node_put(disp_dart);

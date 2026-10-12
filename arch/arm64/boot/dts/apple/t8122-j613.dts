@@ -255,7 +255,9 @@
  * External display on the left-back USB-C port (typec0, ATC0). In the J613
  * ADT dcpext is display-crossbar ufp1, port 0, which is crossbar state 2
  * (dispext1,0) in the T602x model, and ATC0's DisplayPort transmitter is
- * dptx-phy 0. The right port (ATC1) is not described: it is untested.
+ * dptx-phy 0. The left-front port (typec1, ATC1) is not described here:
+ * the display gate adds route@1 for it at boot, when it enables dcpext
+ * (see t6030-display-gate.c).
  *
  * dcpext itself stays disabled here, like the internal DCP. The boot loader
  * finds it through the "dcpext" alias, reserves its firmware and marks it
