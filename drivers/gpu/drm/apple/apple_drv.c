@@ -559,6 +559,13 @@ static int apple_probe_typec_ports(struct drm_device *drm,
 		bool secondary = idx >= nr_ports;
 		u32 mask = 0;
 
+		/* Only a failed T8122 dcpext could drive it: no connector. */
+		if (dcp_typec_port_unusable(port_idx)) {
+			drm_warn(drm, "Type-C port %u: its display pipeline is unusable\n",
+				 port_idx);
+			continue;
+		}
+
 		connector = kzalloc_obj(*connector);
 		if (!connector)
 			return -ENOMEM;
@@ -735,6 +742,13 @@ static int apple_drm_init_dcp(struct device *dev)
 		of_node_put(np);
 		if (!dcp[num_dcp])
 			continue;
+		/* A failed T8122 dcpext: bound, but no pipeline. */
+		if (dcp_ext_unusable(dcp[num_dcp])) {
+			dev_warn(dev, "%s: external display processor unusable, skipped\n",
+				 dev_name(&dcp[num_dcp]->dev));
+			put_device(&dcp[num_dcp]->dev);
+			continue;
+		}
 
 		device_link_add(dev, &dcp[num_dcp]->dev, DL_FLAG_AUTOREMOVE_SUPPLIER);
 

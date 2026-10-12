@@ -278,6 +278,10 @@ static void dcp_recv_msg(void *cookie, u8 endpoint, u64 message)
 
 	trace_dcp_recv_msg(dcp, endpoint, message);
 
+	/* A failed T8122 dcpext: its firmware may still talk, nobody listens. */
+	if (READ_ONCE(dcp->ext_dead))
+		return;
+
 	switch (endpoint) {
 	case IOMFB_ENDPOINT:
 		return iomfb_recv_msg(dcp, message);
@@ -1269,6 +1273,14 @@ bool dcp_fw_compat_is_12_x(struct platform_device *pdev)
 	return dcp->fw_compat == DCP_FIRMWARE_V_12_3;
 }
 
+/* A failed T8122 dcpext: no pipeline of the DRM device. */
+bool dcp_ext_unusable(struct platform_device *pdev)
+{
+	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+
+	return !dcp || READ_ONCE(dcp->ext_dead);
+}
+
 bool dcp_fw_compat_is_14_7(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
@@ -2023,7 +2035,7 @@ static bool dcp_show_notch(struct apple_dcp *dcp)
 	return show_notch || t6030_show_notch;
 }
 
-static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
+static int dcp_comp_bind_pipe(struct device *dev, struct device *main, void *data)
 {
 	struct device_node *panel_np;
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
@@ -2158,6 +2170,27 @@ static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
 	return ret;
 }
 
+static void dcp_ext_give_up(struct apple_dcp *dcp, int err, const char *when);
+
+/*
+ * The T8122 dcpext boots its firmware here. If that fails, it must not take
+ * the internal panel's DRM device down with it: keep it as an unusable pipe.
+ */
+static int dcp_comp_bind(struct device *dev, struct device *main, void *data)
+{
+	struct apple_dcp *dcp = dev_get_drvdata(dev);
+	int ret;
+
+	if (READ_ONCE(dcp->ext_dead))
+		return 0;
+	ret = dcp_comp_bind_pipe(dev, main, data);
+	if (ret && dcp->ext_failsafe) {
+		dcp_ext_give_up(dcp, ret, "bind");
+		return 0;
+	}
+	return ret;
+}
+
 /*
  * We need to shutdown DCP before tearing down the display subsystem. Otherwise
  * the DCP will crash and briefly flash a green screen of death.
@@ -2166,7 +2199,7 @@ static void dcp_comp_unbind(struct device *dev, struct device *main, void *data)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
-	if (!dcp)
+	if (!dcp || READ_ONCE(dcp->ext_dead))
 		return;
 
 	disable_work_sync(&dcp->dimensions_wq);
@@ -2314,7 +2347,7 @@ static int dcp_native_routes_error(struct apple_dcp *dcp, int err)
 	return 0;
 }
 
-static int dcp_platform_probe(struct platform_device *pdev)
+static int dcp_platform_probe_pipe(struct platform_device *pdev)
 {
 	if (of_machine_is_compatible("apple,t8140"))
 		return -ENODEV;
@@ -2346,6 +2379,7 @@ static int dcp_platform_probe(struct platform_device *pdev)
 		return -ENOMEM;
 
 	dcp->fw_compat = fw_compat;
+	dcp->ext_failsafe = of_device_is_compatible(dev->of_node, "apple,t8122-dcpext");
 	dcp->external = of_device_is_compatible(dev->of_node, "apple,t6030-dcpext");
 	dcp->external_native = dcp->external && dcp_t6030_ext_native(dev->of_node);
 	dcp->dev = dev;
@@ -2606,6 +2640,71 @@ fixed_done:
 	return ret;
 }
 
+/*
+ * Marks a T8122 dcpext unusable, for good: its Type-C routes are disabled in
+ * the device tree, so that a USB-C port controller probing later does not
+ * wait for them, and a route already registered ignores mode changes (see
+ * dcp_typec_route_set()), so that USB on the port goes on.
+ */
+static void dcp_ext_give_up(struct apple_dcp *dcp, int err, const char *when)
+{
+	WRITE_ONCE(dcp->ext_dead, true);
+	dev_err(dcp->dev, "external display processor unusable (%s failed: %d); the internal display goes on without it\n",
+		when, err);
+	dcp_typec_routes_disable(dcp);
+}
+
+/*
+ * The T8122 dcpext is a component of the panel's DRM device, so it must
+ * always register one, or the panel stays on the boot framebuffer. Keep
+ * deferring while its suppliers may still appear (bounded by the deferred
+ * probe timeout); on any other failure join as an unusable pipe.
+ */
+static int dcp_platform_probe(struct platform_device *pdev)
+{
+	struct device *dev = &pdev->dev;
+	struct apple_dcp *dcp;
+	void *group;
+	int ret;
+
+	if (!of_device_is_compatible(dev->of_node, "apple,t8122-dcpext"))
+		return dcp_platform_probe_pipe(pdev);
+
+	group = devres_open_group(dev, NULL, GFP_KERNEL);
+	if (!group)
+		return -ENOMEM;
+	ret = dcp_platform_probe_pipe(pdev);
+	if (!ret) {
+		devres_remove_group(dev, group);
+		return 0;
+	}
+
+	dcp = platform_get_drvdata(pdev);
+	if (dcp && dcp->nr_typec_routes) {
+		/* Routes may be in use already: keep them, and the pipe, as they are. */
+		devres_remove_group(dev, group);
+		dcp_ext_give_up(dcp, ret, "probe");
+		return component_add(dev, &dcp_comp_ops);
+	}
+
+	devres_release_group(dev, group);
+	platform_set_drvdata(pdev, NULL);
+	if (ret == -EPROBE_DEFER) {
+		ret = driver_deferred_probe_check_state(dev);
+		if (ret == -EPROBE_DEFER)
+			return ret;
+	}
+
+	dcp = devm_kzalloc(dev, sizeof(*dcp), GFP_KERNEL);
+	if (!dcp)
+		return -ENOMEM;
+	dcp->dev = dev;
+	dcp->ext_failsafe = true;
+	platform_set_drvdata(pdev, dcp);
+	dcp_ext_give_up(dcp, ret, "probe");
+	return component_add(dev, &dcp_comp_ops);
+}
+
 static void dcp_platform_remove(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
@@ -2709,6 +2808,9 @@ static int dcp_platform_suspend(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
 
+	if (READ_ONCE(dcp->ext_dead))
+		return 0;
+
 	/* Serialize PM against explicit bring-up, including queued startup work.
 	 * Before a startup attempt the device remains suspendable. After any
 	 * attempt we cannot prove DMA/firmware quiescence, even on failure.
@@ -2761,6 +2863,9 @@ static int dcp_platform_suspend(struct device *dev)
 static int dcp_platform_resume(struct device *dev)
 {
 	struct apple_dcp *dcp = dev_get_drvdata(dev);
+
+	if (READ_ONCE(dcp->ext_dead))
+		return 0;
 
 	dcp_enable_typec_work(dcp);
 	/* The HDMI output's PHY and crossbar may have lost their setup in sleep. */

@@ -156,6 +156,14 @@ struct apple_dcp {
 	enum dcp_firmware_version fw_compat;
 	bool external;
 	/*
+	 * T8122 dcpext: the panel's DRM device never waits on this processor.
+	 * A probe or bind failure leaves it in the device as an unusable pipe
+	 * (ext_dead): no CRTC, Type-C routes disabled or ignored, RTKit
+	 * messages dropped. See dcp_platform_probe().
+	 */
+	bool ext_failsafe;
+	bool ext_dead;
+	/*
 	 * A T6030 external processor in the main DRM device: the kernel starts
 	 * its firmware on first use, its modes come from the attached display.
 	 * Clear for the manual diagnostic path (separate scanout, explicit start).
