@@ -12,9 +12,12 @@
  * apple,tunable-uuid).
  *
  * The report seeds the display request (DISP, soc-device id 8) and the
- * storage request (ANS, soc-device id 18). The PMP, its DART and its
- * mailbox stay disabled here; the PMP report driver starts the PMP when the
- * display driver first asks for it.
+ * storage request (ANS, soc-device id 18). The external display request
+ * (DISPEXT, soc-device id 9) is described disabled, as on T6030; the
+ * display gate enables it together with the external display processor
+ * (dcpext), before the PMP starts. The PMP, its DART and its mailbox stay
+ * disabled here; the PMP report driver starts the PMP when the display
+ * driver first asks for it.
  *
  * Report entries are numbered by soc-device id - 1 (reg). The T8122 PMP
  * firmware, however, reads the PTD request word as one bit per record of
@@ -57,6 +60,25 @@
 					apple,always-on;
 					apple,soc-device-record;
 					phandle = <0x100>;
+				};
+
+				/*
+				 * DISPEXT (soc-device id 9, acknowledged, as DISP).
+				 * Without it the running PMP keeps the DISP_EXT
+				 * clock domain off, and the dcpext firmware waits
+				 * for it forever in its first modeset.
+				 */
+				pmp_report_dispext0: report@8 {
+					compatible = "apple,t6000-pmp-v2-report-entry";
+					reg = <0x8>;
+					label = "pmp-dispext0";
+					#power-domain-cells = <0>;
+					apple,always-on;
+					apple,soc-device-record;
+					/* A missing DISPEXT ack must not hold up the panel. */
+					apple,defer-startup-ack;
+					phandle = <0x101>;
+					status = "disabled";
 				};
 
 				pmp_report_ans: report@11 {
