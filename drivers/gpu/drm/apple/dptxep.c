@@ -870,7 +870,7 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 static void dptxport_init(struct apple_epic_service *service, const char *name,
 			  const char *class, s64 unit)
 {
-	bool v14_7 = service->ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7;
+	bool v14_7 = dcp_fw_is_14_7(service->ep->dcp);
 
 	if (!name)
 		return;
@@ -949,7 +949,7 @@ int dptxep_init(struct apple_dcp *dcp)
 	init_completion(&dcp->dptxport[1].linkcfg_completion);
 
 	dcp->dptxep = afk_init(dcp, DPTX_ENDPOINT,
-			       dcp->fw_compat == DCP_FIRMWARE_V_14_7 ?
+			       dcp_fw_is_14_7(dcp) ?
 			       dptxep_v14_7_ops : dptxep_ops);
 	if (IS_ERR(dcp->dptxep))
 		return PTR_ERR(dcp->dptxep);
@@ -968,7 +968,7 @@ int dptxep_init(struct apple_dcp *dcp)
 			 * kIOReturnNoDevice (0xe00002c0). Leave the endpoint
 			 * up so a later announce can still bind.
 			 */
-			if (dcp->fw_compat == DCP_FIRMWARE_V_14_7) {
+			if (dcp_fw_is_14_7(dcp)) {
 				dev_info(dcp->dev,
 					 "DPTX port %u not announced yet\n", port);
 				return 0;

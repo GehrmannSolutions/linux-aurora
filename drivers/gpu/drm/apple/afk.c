@@ -500,7 +500,7 @@ static void afk_recv_handle_std_service(struct apple_dcp_afkep *ep, u32 channel,
 	 * service teardown. Use the normal result path to release late-ack DMA
 	 * and command slots with their original allocation lengths.
 	 */
-	if (ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7 &&
+	if (dcp_fw_is_14_7(ep->dcp) &&
 	    eshdr->category == EPIC_CAT_REPLY && payload_size >= 4 &&
 	    payload_size < sizeof(struct epic_cmd)) {
 		struct epic_cmd cmd = {};
@@ -643,7 +643,7 @@ static void afk_recv_handle(struct apple_dcp_afkep *ep, u32 channel, u32 type,
 	 */
 	if ((type == EPIC_TYPE_REPLY ||
 	     (type == EPIC_TYPE_NOTIFY &&
-	      ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7)) &&
+	      dcp_fw_is_14_7(ep->dcp))) &&
 	    eshdr->category == EPIC_CAT_REPLY &&
 	    payload_size >= sizeof(struct epic_cmd))
 		return afk_recv_handle_reply(ep, channel,
@@ -765,7 +765,7 @@ static void afk_receive_message_worker(struct work_struct *work_)
 
 	case RBEP_START_ACK:
 		/* 14.7 can queue messages before it acknowledges the start. */
-		if (work->ep->dcp->fw_compat == DCP_FIRMWARE_V_14_7)
+		if (dcp_fw_is_14_7(work->ep->dcp))
 			while (afk_recv(work->ep))
 				;
 		complete_all(&work->ep->started);

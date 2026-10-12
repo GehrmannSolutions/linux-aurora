@@ -23,6 +23,7 @@
 #include "iomfb_v12_3.h"
 #include "iomfb_v13_3.h"
 #include "iomfb_v14_7.h"
+#include "iomfb_v14_7_tpl.h"
 #include "iomfb_v26_6.h"
 #include "epic/dpavservep.h"
 
@@ -43,6 +44,13 @@ enum dcp_firmware_version {
 	DCP_FIRMWARE_V_13_5,
 	DCP_FIRMWARE_V_14_7,
 	DCP_FIRMWARE_V_26_6,
+	/*
+	 * 14.7 firmware on a processor that Linux starts itself and drives
+	 * through the classic IOMFB template (iomfb_v14_7_tpl.c), as M1/M2
+	 * external processors: the T8122 dcpext. Its AFK, DPTX and DPAV
+	 * endpoints speak the 14.7 protocol (dcp_fw_is_14_7()).
+	 */
+	DCP_FIRMWARE_V_14_7_TEMPLATE,
 };
 
 enum {
@@ -235,6 +243,7 @@ struct apple_dcp {
 	union {
 		struct dcp_swap_submit_req_v12_3 v12_3;
 		struct dcp_swap_submit_req_v13_3 v13_3;
+		struct dcp_swap_submit_req_v14_7_0 v14_7_0;
 	} swap;
 
 	/* swap id of the last completed swap */
@@ -422,6 +431,18 @@ int dcp_backlight_register(struct apple_dcp *dcp);
 int dcp_backlight_update(struct apple_dcp *dcp);
 s32 dcp_ext_backlight_value(struct apple_dcp *dcp);
 bool dcp_has_panel(struct apple_dcp *dcp);
+
+/*
+ * Does @dcp run 14.7 firmware, whichever IOMFB path drives it? For the
+ * firmware protocol of the AFK, DPTX and DPAV endpoints. The IOMFB path
+ * itself is chosen by fw_compat: DCP_FIRMWARE_V_14_7 is Aurora's DCPLink
+ * session, DCP_FIRMWARE_V_14_7_TEMPLATE the classic IOMFB template.
+ */
+static inline bool dcp_fw_is_14_7(const struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_14_7 ||
+	       dcp->fw_compat == DCP_FIRMWARE_V_14_7_TEMPLATE;
+}
 
 #define DCP_AUDIO_MAX_CHANS 15
 
