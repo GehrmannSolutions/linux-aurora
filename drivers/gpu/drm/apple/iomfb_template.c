@@ -481,8 +481,25 @@ static struct DCP_FW_NAME(dcp_map_reg_resp) dcpep_cb_map_reg(struct apple_dcp *d
 	} else {
 		struct resource *rsrc = dcp->disp_registers[req->index];
 #if DCP_FW_VER >= DCP_FW_VERSION(13, 2, 0)
-		dma_addr_t dva = dma_map_resource(dcp->dev, rsrc->start, resource_size(rsrc),
-						  DMA_BIDIRECTIONAL, 0);
+		dma_addr_t dva;
+
+		/*
+		 * In "Dashboard" RT bandwidth mode (bw-scratch without a
+		 * bw-doorbell, e.g. t8122) the firmware's only write through
+		 * this mapping is a 64-bit zero to the pmgr dashboard on
+		 * power-off. dart-dcp rejects it (FILL_REGION|NO_PTE) and the
+		 * DCP crashes, so hand the firmware a RAM page instead.
+		 */
+		if (dcp->disp_bw_scratch_index && !dcp->disp_bw_doorbell_index &&
+		    req->index == dcp->disp_bw_scratch_index) {
+			if (!dmam_alloc_coherent(dcp->dev, resource_size(rsrc),
+						 &dva, GFP_KERNEL))
+				dva = DMA_MAPPING_ERROR;
+		} else {
+			dva = dma_map_resource(dcp->dev, rsrc->start,
+					       resource_size(rsrc),
+					       DMA_BIDIRECTIONAL, 0);
+		}
 		WARN_ON(dva == DMA_MAPPING_ERROR);
 #endif
 
