@@ -125,6 +125,37 @@ static void pmp_devices_reordered(struct kunit *test)
 	KUNIT_EXPECT_FALSE(test, apple_pmp_devices_valid(table, len, seed, seed, false));
 }
 
+/* T8122 (J613): the PMP reads its request word by record, not by ID - 1. */
+static void pmp_records_t8122(struct kunit *test)
+{
+	static const u32 ids[] = {
+		1, 2, 19, 20, 16, 17, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 18,
+	};
+	const size_t len = ARRAY_SIZE(ids) * PMP_SOC_DEVICE_SIZE;
+	u64 seed = BIT_ULL(11) | BIT_ULL(12);
+	u8 *table = kunit_kzalloc(test, len, GFP_KERNEL);
+	unsigned int i;
+
+	KUNIT_ASSERT_NOT_NULL(test, table);
+	for (i = 0; i < ARRAY_SIZE(ids); i++) {
+		put_unaligned_le32(ids[i], table + i * PMP_SOC_DEVICE_SIZE);
+		if (ids[i] == 8 || ids[i] == 9)
+			put_unaligned_le32(0xa, table + i * PMP_SOC_DEVICE_SIZE + 8);
+	}
+	/* DISP (8), DISPEXT (9), ANS (18) */
+	KUNIT_EXPECT_EQ(test, apple_pmp_record_of_id(table, len, 8), 11);
+	KUNIT_EXPECT_EQ(test, apple_pmp_record_of_id(table, len, 9), 12);
+	KUNIT_EXPECT_EQ(test, apple_pmp_record_of_id(table, len, 18), 19);
+	KUNIT_EXPECT_EQ(test, apple_pmp_record_of_id(table, len, 21), -ENOENT);
+	KUNIT_EXPECT_EQ(test, apple_pmp_record_of_id(table, len, 0), -ENOENT);
+	KUNIT_EXPECT_EQ(test, apple_pmp_record_of_id(table, len - 1, 8), -ENOENT);
+	KUNIT_EXPECT_TRUE(test, apple_pmp_records_valid(table, len, seed, seed));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_records_valid(table, len, seed, 0));
+	KUNIT_EXPECT_FALSE(test, apple_pmp_records_valid(table, len, BIT_ULL(20), 0));
+	put_unaligned_le32(8, table + 12 * PMP_SOC_DEVICE_SIZE);
+	KUNIT_EXPECT_EQ(test, apple_pmp_record_of_id(table, len, 8), -ENOENT);
+}
+
 static void pmp_bootargs_valid_ids(struct kunit *test)
 {
 	u8 args[32];
@@ -172,6 +203,7 @@ static struct kunit_case apple_pmp_report_cases[] = {
 	KUNIT_CASE(pmp_ranges_reject_wrapped_base),
 	KUNIT_CASE(pmp_devices_seed_and_ack),
 	KUNIT_CASE(pmp_devices_reordered),
+	KUNIT_CASE(pmp_records_t8122),
 	KUNIT_CASE(pmp_bootargs_valid_ids),
 	KUNIT_CASE(pmp_bootargs_reject_truncation),
 	KUNIT_CASE(pmp_bootargs_reject_integer_width),

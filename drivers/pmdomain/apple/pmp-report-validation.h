@@ -3,6 +3,7 @@
 #define _APPLE_PMP_REPORT_VALIDATION_H
 
 #include <linux/bitops.h>
+#include <linux/errno.h>
 #include <linux/types.h>
 #include <linux/unaligned.h>
 
@@ -67,6 +68,55 @@ static inline bool apple_pmp_devices_valid(const u8 *table, size_t len,
 		found |= bit;
 	}
 	return found == seed;
+}
+
+/*
+ * The index of the soc-device record that holds device ID @id, or -ENOENT if
+ * no record or more than one does. A PMP that reads its request word by
+ * record (T8122) wants the bit of that index, not ID - 1.
+ */
+static inline int apple_pmp_record_of_id(const u8 *table, size_t len, u32 id)
+{
+	int found = -ENOENT;
+	size_t pos;
+
+	if (!table || !len || len % PMP_SOC_DEVICE_SIZE || !id)
+		return -ENOENT;
+	for (pos = 0; pos < len; pos += PMP_SOC_DEVICE_SIZE) {
+		if (get_unaligned_le32(table + pos) != id)
+			continue;
+		if (found >= 0)
+			return -ENOENT;
+		found = pos / PMP_SOC_DEVICE_SIZE;
+	}
+	return found;
+}
+
+/*
+ * Request bit N names soc-device record N. Each seeded record must exist and
+ * be acknowledged exactly when its flags say so.
+ */
+static inline bool apple_pmp_records_valid(const u8 *table, size_t len,
+					   u64 seed, u64 ack)
+{
+	u64 bits = seed;
+
+	if (!table || !len || len % PMP_SOC_DEVICE_SIZE || (ack & ~seed))
+		return false;
+	while (bits) {
+		unsigned int n = __ffs64(bits);
+		const u8 *dev;
+
+		bits &= bits - 1;
+		if ((size_t)(n + 1) * PMP_SOC_DEVICE_SIZE > len)
+			return false;
+		dev = table + n * PMP_SOC_DEVICE_SIZE;
+		if (!get_unaligned_le32(dev) ||
+		    !!(get_unaligned_le32(dev + 8) & PMP_SOC_DEVICE_ACK) !=
+		    !!(ack & BIT_ULL(n)))
+			return false;
+	}
+	return true;
 }
 
 /* Packed integer arguments are validated before the PMP driver patches them. */
