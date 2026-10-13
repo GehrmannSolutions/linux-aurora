@@ -663,6 +663,16 @@ static inline bool dcp_fw_is_14_7(const struct apple_dcp *dcp)
 }
 
 /*
+ * The internal panel's processor on Aurora's DCPLink session (T6030, T8122).
+ * On J613 it also has a Type-C display route, which the display gate enables
+ * at boot together with the dcpext.
+ */
+static inline bool dcp_is_v14_panel(const struct apple_dcp *dcp)
+{
+	return dcp->fw_compat == DCP_FIRMWARE_V_14_7 && !dcp->external;
+}
+
+/*
  * The T8122 dcpext connects its DPTX port as AsahiLinux/linux#607 does,
  * the kernel this firmware was first driven with: no validation of the
  * target, a connect without the supports-HPD attribute, GET_SUPPORTS_HPD
