@@ -64,6 +64,8 @@ struct apple_dcp_typec_port {
 	/* Direct DP-alt: the port is in DP mode, routed or not, and its HPD. */
 	bool dp_wanted;
 	bool dp_hpd;
+	/* the wait for a pipeline was logged since the port entered DP mode */
+	bool busy_noted;
 	/* dcp_typec_rebalance_locked()'s plan for the port's two streams */
 	struct apple_dcp_typec_route *target;
 	struct apple_dcp_typec_route *secondary_target;
@@ -1191,6 +1193,26 @@ void dcp_typec_reorder(void)
 		dcp_typec_rebalance_locked(NULL, 0);
 }
 
+/*
+ * A DP display on @port gets no pipeline: every one that could drive it
+ * drives another display. Say so once per plug, in words a user can act on;
+ * the port controller only logs the -EBUSY.
+ */
+static int dcp_typec_port_busy(struct apple_dcp_typec_port *port,
+			       struct apple_dcp *dcp)
+{
+	const char *label = NULL;
+
+	if (port->busy_noted)
+		return -EBUSY;
+	port->busy_noted = true;
+	of_property_read_string(port->connector_np, "label", &label);
+	dev_info(dcp->dev,
+		 "display on %s waits for an external display pipeline: it drives another display; to switch, unplug that one, then plug this one in again\n",
+		 label ?: "a USB-C port");
+	return -EBUSY;
+}
+
 static int dcp_typec_route_set(struct typec_mux_dev *mux,
 			       struct typec_mux_state *state)
 {
@@ -1249,6 +1271,7 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 	if (!is_dp) {
 		port->dp_wanted = false;
 		port->dp_hpd = false;
+		port->busy_noted = false;
 
 		/* a Thunderbolt/USB4 DP tunnel is torn down by its own path */
 		if (port->owner && port->owner->tunnel) {
@@ -1306,7 +1329,7 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 			dcp_typec_rebalance_locked(NULL, 0);
 		if (!port->owner) {
 			if (hpd)
-				return -EBUSY;
+				return dcp_typec_port_busy(port, route->dcp);
 			port->applied_valid = true;
 			return 0;
 		}
@@ -1320,7 +1343,7 @@ static int dcp_typec_route_set(struct typec_mux_dev *mux,
 	if (!port->owner) {
 		best = dcp_typec_free_route(port);
 		if (!best)
-			return -EBUSY;
+			return dcp_typec_port_busy(port, route->dcp);
 
 		ret = dcp_typec_route_activate(best, best->xbar);
 		if (ret)
