@@ -1490,6 +1490,11 @@ void DCP_FW_NAME(iomfb_flush)(struct apple_dcp *dcp, struct drm_crtc *crtc, stru
 		req->swap.src_rect[l] = apple_state->src_rect;
 		req->swap.dst_rect[l] = apple_state->dst_rect;
 
+#if DCP_FW_VER >= DCP_FW_VERSION(14, 7, 0)
+		/* As asahi-wip-7.2 does, which drives 14.7 dcpext this way. */
+		req->swap.surf_ids[l] = plane->base.id;
+#endif
+
 		if (dcp->notch_height > 0)
 			req->swap.dst_rect[l].y += dcp->notch_height;
 

@@ -628,7 +628,7 @@ int dcp_attributes_replace(struct apple_dcp *dcp, struct dcp_parse_ctx *handle,
 	schedule_work(&dcp->dimensions_wq);
 	/* 14.7 swaps carry no external backlight level. */
 	ext = backlight_control && !dcp_has_panel(dcp) &&
-	      dcp->fw_compat != DCP_FIRMWARE_V_14_7;
+	      !dcp_fw_is_14_7(dcp);
 	if (ext != READ_ONCE(dcp->ext_backlight)) {
 		WRITE_ONCE(dcp->ext_backlight, ext);
 		if (dcp->connector)
@@ -821,6 +821,9 @@ int dcp_crtc_atomic_modeset(struct drm_crtc *crtc,
 	case DCP_FIRMWARE_V_14_7:
 		ret = iomfb_v14_7_modeset(dcp, crtc_state);
 		break;
+	case DCP_FIRMWARE_V_14_7_TEMPLATE:
+		ret = iomfb_modeset_v14_7_0(dcp, crtc_state);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n",
 			  dcp->fw_compat);
@@ -973,6 +976,9 @@ void dcp_flush(struct drm_crtc *crtc, struct drm_atomic_state *state)
 	case DCP_FIRMWARE_V_13_5:
 		iomfb_flush_v13_3(dcp, crtc, state);
 		break;
+	case DCP_FIRMWARE_V_14_7_TEMPLATE:
+		iomfb_flush_v14_7_0(dcp, crtc, state);
+		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
 		break;
@@ -987,6 +993,9 @@ static void iomfb_start(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_V_13_5:
 		iomfb_start_v13_3(dcp);
+		break;
+	case DCP_FIRMWARE_V_14_7_TEMPLATE:
+		iomfb_start_v14_7_0(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);
@@ -1042,6 +1051,9 @@ void iomfb_shutdown(struct apple_dcp *dcp)
 		break;
 	case DCP_FIRMWARE_V_13_5:
 		iomfb_shutdown_v13_3(dcp);
+		break;
+	case DCP_FIRMWARE_V_14_7_TEMPLATE:
+		iomfb_shutdown_v14_7_0(dcp);
 		break;
 	default:
 		WARN_ONCE(true, "Unexpected firmware version: %u\n", dcp->fw_compat);

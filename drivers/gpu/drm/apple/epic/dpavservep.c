@@ -215,7 +215,7 @@ const struct drm_edid *dcpavserv_copy_edid(struct apple_dcp *dcp)
 	 * The 14.7 firmware of an external processor answers EDID requests
 	 * once its service has been opened; open each announced instance once.
 	 */
-	if (dcp->fw_compat == DCP_FIRMWARE_V_14_7 &&
+	if (dcp_fw_is_14_7(dcp) &&
 	    READ_ONCE(dcp->dcpavserv.opened) != service) {
 		int ret = afk_service_call(service, 4, 6, NULL, 0, 32, NULL, 0, 32);
 
