@@ -629,7 +629,8 @@ static int dptxport_call_get_supports_hpd(struct apple_epic_service *service,
 	 * DEVICE_NOT_STARTED (~5.5s). Advertise HPD so firmware uses
 	 * that path instead of waiting for a PHY start.
 	 */
-	reply->supported = cpu_to_le32(dcp_is_typec_output(dcp) ? 1 : 0);
+	reply->supported = cpu_to_le32(dcp_is_typec_output(dcp) &&
+				       !dcp_ext_dptx_607(dcp) ? 1 : 0);
 	dev_info(dcp->dev, "DPTXPort: GET_SUPPORTS_HPD %u usb4=%d\n",
 		 le32_to_cpu(reply->supported), dcp_is_usb4_output(dcp));
 	return 0;
@@ -816,11 +817,18 @@ static int dptxport_call(struct apple_epic_service *service, u32 idx,
 			 service->ep->dcp->dptx_phy);
 		memcpy(reply, data, min(reply_size, data_size));
 		return 0;
-	case DPTX_APCALL_SET_TILED_DISPLAY_HINTS:
+	case DPTX_APCALL_SET_TILED_DISPLAY_HINTS: {
+		int ret;
+
 		memcpy(reply, data, min(reply_size, data_size));
-		return dptxport_call_set_tiled_display_hint(service, data,
-							    data_size, reply,
-							    reply_size);
+		ret = dptxport_call_set_tiled_display_hint(service, data,
+							   data_size, reply,
+							   reply_size);
+		/* The T8122 dcpext gets 0, as from AsahiLinux/linux#607. */
+		if (!ret && reply_size >= 4 && dcp_ext_dptx_607(service->ep->dcp))
+			memset(reply, 0, 4);
+		return ret;
+	}
 	case DPTX_APCALL_GET_DRIVE_SETTINGS:
 		return dptxport_call_get_drive_settings(service, data, data_size,
 							reply, reply_size);
