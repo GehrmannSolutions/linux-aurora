@@ -264,6 +264,10 @@ struct apple_dcp {
 	/* One HPD pulse after a placeholder EDID, per Type-C connection. */
 	bool placeholder_retried;
 	u64 typec_generation;	/* hpd_mutex: identifies the current connection */
+	/* hpd_mutex: Type-C displays unplugged so far; see dcp_poweroff() */
+	u64 typec_unplugs;
+	/* typec_unplugs when the CRTC was last powered on */
+	u64 crtc_unplugs;
 	u64 placeholder_generation;
 	struct delayed_work placeholder_edid_wq;
 	bool use_timestamps;

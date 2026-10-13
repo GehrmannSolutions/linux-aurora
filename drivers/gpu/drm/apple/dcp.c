@@ -1150,6 +1150,7 @@ int dcp_dptx_disconnect_oob(struct platform_device *pdev, u32 port)
 		scoped_guard(mutex, &dcp->hpd_mutex) {
 			WRITE_ONCE(dcp->typec_cable_connected, false);
 			dcp->typec_generation++;
+			dcp->typec_unplugs++;
 			/* Nothing left to retry for the display that went. */
 			if (dcp->external_native)
 				cancel_delayed_work(&dcp->external_retry_wq);
@@ -1545,6 +1546,8 @@ void dcp_poweron(struct platform_device *pdev)
 	int ret;
 
 	if (dcp_is_typec_output(dcp)) {
+		scoped_guard(mutex, &dcp->hpd_mutex)
+			dcp->crtc_unplugs = dcp->typec_unplugs;
 		wait_for_typec_hpd = READ_ONCE(dcp->typec_crtc_off) &&
 				    READ_ONCE(dcp->typec_cable_connected);
 		WRITE_ONCE(dcp->typec_crtc_off, false);
@@ -1604,11 +1607,32 @@ void dcp_poweron(struct platform_device *pdev)
 void dcp_poweroff(struct platform_device *pdev)
 {
 	struct apple_dcp *dcp = platform_get_drvdata(pdev);
+	bool display_gone = false;
 	int ret;
 
 	cancel_delayed_work(&dcp->swap_watchdog_wq);
 	if (dcp->avep)
 		av_service_disconnect(dcp);
+
+	/*
+	 * The display this CRTC was powered on for has been unplugged since:
+	 * its link went down with the cable (dcp_dptx_disconnect_oob()), and
+	 * the desktop only now turns the CRTC off. By then the pipeline may
+	 * already drive the next display, on this port or on another one that
+	 * was waiting for it, and that connection is not the CRTC's to
+	 * release: dropping its HPD makes the firmware report the new display
+	 * inactive, and it stays dark.
+	 */
+	if (dcp_is_typec_output(dcp)) {
+		scoped_guard(mutex, &dcp->hpd_mutex)
+			display_gone = dcp->typec_unplugs != dcp->crtc_unplugs;
+		if (display_gone) {
+			dev_dbg(dcp->dev,
+				"CRTC off after its display was unplugged: leaving the current connection alone\n");
+			_dcp_poweroff(dcp);
+			return;
+		}
+	}
 
 	/*
 	 * Powering a Type-C CRTC off drops DCP's synthetic HPD, and the firmware
