@@ -297,13 +297,19 @@ struct apple_dcp {
 	struct apple_dcp_v14 *v14;
 	/*
 	 * J613: the internal panel's pipe also has a Type-C route. The driver
-	 * tells its firmware the lid state, and powers the panel off while the
-	 * lid is closed (see dcp_lid_*()). While the lid is
-	 * closed the panel's connector is reported disconnected
-	 * (clamshell_panel_away; clamshell_panel_work).
+	 * tells its firmware the lid state, and powers the panel off with its
+	 * CRTC while the lid is closed (see dcp_lid_*()).
 	 */
 	bool clamshell;
 	struct work_struct clamshell_start_work;
+	/*
+	 * The lid is closed and the panel and its CRTC off: the route may
+	 * drive a Type-C display (see dcp_typec_pipeline_changed()). While the
+	 * lid is closed, and until a display that had the pipe let go of it,
+	 * the panel's connector is reported disconnected (clamshell_panel_away;
+	 * clamshell_panel_work).
+	 */
+	bool clamshell_free;
 	bool clamshell_panel_away;
 	/* The pipe's one CRTC is on (dcp_poweron() to dcp_poweroff()). */
 	bool clamshell_crtc_on;
@@ -685,17 +691,22 @@ static inline bool dcp_is_v14_panel(const struct apple_dcp *dcp)
 	return dcp->fw_compat == DCP_FIRMWARE_V_14_7 && !dcp->external;
 }
 
+/* J613 internal pipe: its route took a Type-C display; the lid changed. */
+void dcp_clamshell_attached(struct apple_dcp *dcp, struct device_node *connector_np);
+void dcp_clamshell_changed(struct apple_dcp *dcp);
+
 /*
  * The T8122 dcpext connects its DPTX port as AsahiLinux/linux#607 does,
  * the kernel this firmware was first driven with: no validation of the
  * target, a connect without the supports-HPD attribute, GET_SUPPORTS_HPD
  * answered with 0, HPD asserted only after the link-configuration wait,
- * and tiled display hints acknowledged with 0. Every other DCP keeps the
- * Type-C model of dcp_dptx_connect_session().
+ * and tiled display hints acknowledged with 0. So does the J613 internal
+ * pipe on its Type-C route, whose firmware is the same image. Every other
+ * DCP keeps the Type-C model of dcp_dptx_connect_session().
  */
 static inline bool dcp_ext_dptx_607(const struct apple_dcp *dcp)
 {
-	return dcp->fw_compat == DCP_FIRMWARE_V_14_7_TEMPLATE;
+	return dcp->fw_compat == DCP_FIRMWARE_V_14_7_TEMPLATE || dcp->clamshell;
 }
 
 /* The T8140 external processor (dispext0) running H17P firmware. */
