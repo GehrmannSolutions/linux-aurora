@@ -18,6 +18,14 @@
 #define DCP_V14_SWAP_ENABLED		0x14c
 #define DCP_V14_SWAP_COMPLETED		0x150
 #define DCP_V14_SWAP_BACKGROUND		0x154
+/*
+ * Panel brightness (J516S, 14.8.3 stub): an update byte at 0x354 and the
+ * target as a double in nits at 0x35c. Found on the hardware: the firmware
+ * logs brightness_changed with the value it took, and the panel follows.
+ * 26.6 keeps the same update byte but the double at 0x35e.
+ */
+#define DCP_V14_SWAP_BRIGHTNESS_UPDATE	0x354
+#define DCP_V14_SWAP_BRIGHTNESS_NITS	0x35c
 #define DCP_V14_SWAP_SURFACE(p)		(0x508 + (p) * DCP_V14_SURFACE_SIZE)
 #define DCP_V14_SWAP_IOVA(p)		(0xdb8 + (p) * 8)
 #define DCP_V14_SWAP_SURF_NULL(p)	(0x1b4b + (p))
@@ -113,6 +121,25 @@ static inline void dcp_v14_encode_swap(u8 *swap, u32 id, u32 background, const u
 		dcp_v14_put_rect(swap + DCP_V14_SWAP_DST(layer), 0, dst_y, width, height);
 		swap[DCP_V14_SWAP_SURF_NULL(layer)] = 0;
 	}
+}
+
+/* Whole nits as an IEEE 754 double, without floating point in the kernel. */
+static inline u64 dcp_v14_nits_to_double(u32 nits)
+{
+	u32 exponent;
+
+	if (!nits)
+		return 0;
+	exponent = fls(nits) - 1;
+	return ((u64)(1023 + exponent) << 52) |
+	       (((u64)nits << (52 - exponent)) & GENMASK_ULL(51, 0));
+}
+
+/* Asks for @nits in a swap record built by dcp_v14_encode_swap(). */
+static inline void dcp_v14_encode_brightness(u8 *swap, u32 nits)
+{
+	swap[DCP_V14_SWAP_BRIGHTNESS_UPDATE] = 1;
+	put_unaligned_le64(dcp_v14_nits_to_double(nits), swap + DCP_V14_SWAP_BRIGHTNESS_NITS);
 }
 
 #endif /* __APPLE_IOMFB_V14_7_SWAP_H__ */

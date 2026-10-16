@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR MIT
 
+#include <linux/backlight.h>
 #include <linux/clk.h>
 #include <linux/debugfs.h>
 #include <linux/device.h>
@@ -65,6 +66,23 @@
 /* IOMFB layer of the primary plane. */
 #define DCP_V14_LAYER		0
 #define DCP_V14_BLACK		0xff000000
+
+/* A backlight device driving the T6030 panel through swaps (see dcp_v14_brightness_*). */
+static bool t6030_backlight;
+module_param(t6030_backlight, bool, 0444);
+MODULE_PARM_DESC(t6030_backlight,
+		 "T6030 built-in panel: register a backlight device, in nits (default off)");
+/* Local J613 experiment, restricted by its existing board/firmware admission. */
+static bool j613_backlight;
+module_param(j613_backlight, bool, 0444);
+MODULE_PARM_DESC(j613_backlight,
+                "J613 14.x built-in panel: experimental swap brightness in nits (default off)");
+/* Reported until the first request; the firmware keeps the iBoot level until then. */
+#define DCP_V14_DEFAULT_NITS	140
+/* SDR maximum of the J516S panel; the DT gives the panel's own. */
+#define DCP_V14_T6030_MAX_NITS	500
+/* How long a brightness request waits for a flip to carry it. */
+#define DCP_V14_BL_FLIP_WAIT	msecs_to_jiffies(25)
 
 static const struct dcp_v14_board dcp_v14_board_t6030 = {
 	.name = "T6030",
@@ -185,6 +203,22 @@ struct apple_dcp_v14 {
 	/* The last firmware backlight correction notification; not a nits target. */
 	u32 backlight_factor;
 	u64 backlight_factor_updates;
+	/* Panel brightness, carried by swaps. Under the lock. */
+	u32 bl_nits;		/* requested */
+	u32 bl_sent;		/* carried by the last brightness swap */
+	u64 bl_seq;		/* bumped by every change of the target */
+	u64 bl_swaps;
+	bool bl_owned;		/* requested at least once: the driver sets it */
+	bool bl_off;		/* the CRTC is off: the target is 0 */
+	bool bl_pending;	/* the target has not been carried yet */
+	bool bl_queued;		/* the backlight device is being registered */
+	wait_queue_head_t bl_wait;
+	/* Guards bl_dev against registration racing removal. */
+	struct mutex bl_lock;
+	struct work_struct bl_register_work;
+	struct backlight_device *bl_dev;
+	bool bl_detached;
+	u32 bl_max;		/* 0: no backlight device */
 	u32 ctm_status, ctm_get_status;
 	u64 ctm_readback[9];
 	struct work_struct idle_work;
@@ -266,6 +300,9 @@ struct apple_dcp_v14 {
 	u64 swaps;
 	u64 swap_ns_max;
 };
+
+static void dcp_v14_backlight_register(struct work_struct *work);
+static void dcp_v14_backlight_detach(struct apple_dcp_v14 *v14);
 
 /*
  * The panel's DCP session; one per boot, RTKit is never started twice. The
@@ -1582,6 +1619,9 @@ int iomfb_v14_7_probe(struct apple_dcp *dcp)
 	v14->dcp = dcp;
 	mutex_init(&v14->lock);
 	mutex_init(&v14->present_lock);
+	init_waitqueue_head(&v14->bl_wait);
+	mutex_init(&v14->bl_lock);
+	INIT_WORK(&v14->bl_register_work, dcp_v14_backlight_register);
 	init_waitqueue_head(&v14->described_wait);
 	INIT_WORK(&v14->idle_work, dcp_v14_idle);
 	ret = devm_add_action_or_reset(dev, dcp_v14_release, v14);
@@ -2021,6 +2061,9 @@ static int dcpext_boot(struct apple_dcp *dcp)
 	}
 	mutex_init(&v14->lock);
 	mutex_init(&v14->present_lock);
+	init_waitqueue_head(&v14->bl_wait);
+	mutex_init(&v14->bl_lock);
+	INIT_WORK(&v14->bl_register_work, dcp_v14_backlight_register);
 	init_waitqueue_head(&v14->described_wait);
 	INIT_WORK(&v14->idle_work, dcp_v14_idle);
 	INIT_WORK(&v14->stopped_work, dcp_v14_stopped_work);
@@ -2253,6 +2296,7 @@ void iomfb_v14_7_unbind(struct apple_dcp *dcp)
 		flush_work(&v14->idle_work);
 		cancel_work_sync(&v14->stopped_work);
 	} else {
+		dcp_v14_backlight_detach(v14);
 		WRITE_ONCE(v14->dcp, NULL);
 	}
 	if (v14->rtk)
@@ -2322,6 +2366,9 @@ static int dcp_v14_status_show(struct seq_file *m, void *unused)
 		   v14->stride, v14->clock_rate);
 	seq_printf(m, "backlight factor %#x updates %llu\n",
 		   v14->backlight_factor, v14->backlight_factor_updates);
+	seq_printf(m, "backlight %d max %u\nbrightness requested %u sent %u owned %d off %d pending %d swaps %llu\n",
+		   !!READ_ONCE(v14->bl_dev), v14->bl_max, v14->bl_nits, v14->bl_sent,
+		   v14->bl_owned, v14->bl_off, v14->bl_pending, v14->bl_swaps);
 	seq_printf(m, "ctm valid %d disabled %d calls %llu setter %#x getter %#x\n",
 		   v14->ctm_valid, v14->ctm_disabled, v14->ctm_calls, v14->ctm_status,
 		   v14->ctm_get_status);
@@ -2436,6 +2483,13 @@ int iomfb_v14_7_start(struct apple_dcp *dcp)
 	if (ret)
 		goto fail;
 
+	/* Nits; the backlight device appears with the first frame. */
+	if (((v14->board == &dcp_v14_board_t6030 && t6030_backlight) ||
+             (v14->board == &dcp_v14_board_j613 && j613_backlight)) &&
+            dcp->brightness.maximum) {
+		v14->bl_max = min_t(u32, dcp->brightness.maximum, DCP_V14_T6030_MAX_NITS);
+		v14->bl_nits = min_t(u32, DCP_V14_DEFAULT_NITS, v14->bl_max);
+	}
 	v14->started = true;
 	/* Never removed, like the session it describes. */
 	debugfs_create_file(v14->board->debugfs, 0400, NULL, v14, &dcp_v14_status_fops);
@@ -2562,6 +2616,183 @@ static bool dcp_v14_swap_admit(void *cookie)
 }
 
 /*
+ * Panel brightness travels in the swap record, in nits, as on 26.6.
+ *
+ * Until the first request the firmware keeps the brightness iBoot set, and
+ * no swap touches it. From then on the driver sets it: a request, the CRTC
+ * going off (0 nits) and the CRTC coming back (the requested nits) each make
+ * the target pending, and the next swap carries it. A request waits a frame
+ * for a flip to carry it, then makes a swap of its own (see
+ * dcp_v14_brightness_commit()).
+ */
+
+/* Called with the lock held. */
+static void dcp_v14_brightness_changed(struct apple_dcp_v14 *v14)
+{
+	lockdep_assert_held(&v14->lock);
+	if (!v14->bl_owned)
+		return;
+	WRITE_ONCE(v14->bl_pending, true);
+	v14->bl_seq++;
+}
+
+/* Adds a pending target to @swap; returns the token dcp_v14_brightness_done() takes. */
+static u64 dcp_v14_brightness_encode(struct apple_dcp_v14 *v14, u8 *swap)
+{
+	lockdep_assert_held(&v14->lock);
+	if (!v14->bl_max || !v14->bl_pending)
+		return 0;
+	dcp_v14_encode_brightness(swap, v14->bl_off ? 0 : v14->bl_nits);
+	return v14->bl_seq;
+}
+
+/* A swap completed; @token is what it carried. Called with the lock held. */
+static void dcp_v14_brightness_done(struct apple_dcp_v14 *v14, u64 token)
+{
+	lockdep_assert_held(&v14->lock);
+	if (!v14->bl_max)
+		return;
+	/* The first frame is on the panel: KMS is up, so is the backlight now. */
+	if (!v14->bl_queued) {
+		v14->bl_queued = true;
+		schedule_work(&v14->bl_register_work);
+	}
+	if (!token)
+		return;
+	v14->bl_swaps++;
+	/* A change made since then is still pending. */
+	if (token != v14->bl_seq)
+		return;
+	v14->bl_sent = v14->bl_off ? 0 : v14->bl_nits;
+	WRITE_ONCE(v14->bl_pending, false);
+	wake_up_all(&v14->bl_wait);
+}
+
+/*
+ * Makes a swap for a pending brightness: a commit of the CRTC alone, which
+ * shows the plane as it is. Nothing is done while the CRTC is off (enabling
+ * it sends the brightness) or before its first modeset (the first frame
+ * sends it), nor when a flip carried it in the meantime.
+ */
+static int dcp_v14_brightness_commit(struct apple_dcp_v14 *v14)
+{
+	struct apple_dcp *dcp = READ_ONCE(v14->dcp);
+	struct drm_modeset_acquire_ctx ctx;
+	struct drm_crtc_state *crtc_state;
+	struct drm_atomic_state *state;
+	struct drm_crtc *crtc;
+	int ret;
+
+	if (!dcp || !dcp->crtc)
+		return 0;
+	crtc = &dcp->crtc->base;
+	state = drm_atomic_state_alloc(crtc->dev);
+	if (!state)
+		return -ENOMEM;
+	drm_modeset_acquire_init(&ctx, DRM_MODESET_ACQUIRE_INTERRUPTIBLE);
+	state->acquire_ctx = &ctx;
+retry:
+	ret = drm_modeset_lock(&crtc->mutex, &ctx);
+	if (ret)
+		goto out;
+	if (!crtc->state || !crtc->state->active || !READ_ONCE(v14->bl_pending))
+		goto out;
+	crtc_state = drm_atomic_get_crtc_state(state, crtc);
+	if (IS_ERR(crtc_state)) {
+		ret = PTR_ERR(crtc_state);
+		goto out;
+	}
+	ret = drm_atomic_commit(state);
+out:
+	if (ret == -EDEADLK) {
+		drm_atomic_state_clear(state);
+		ret = drm_modeset_backoff(&ctx);
+		if (!ret)
+			goto retry;
+	}
+	drm_atomic_state_put(state);
+	drm_modeset_drop_locks(&ctx);
+	drm_modeset_acquire_fini(&ctx);
+	return ret;
+}
+
+static int dcp_v14_backlight_update(struct backlight_device *bd)
+{
+	struct apple_dcp_v14 *v14 = bl_get_data(bd);
+	int ret = 0;
+
+	mutex_lock(&v14->lock);
+	if (v14->failed) {
+		ret = -EIO;
+	} else {
+		/* Sent even when unchanged: it also repairs the firmware's value. */
+		v14->bl_nits = backlight_get_brightness(bd);
+		v14->bl_owned = true;
+		dcp_v14_brightness_changed(v14);
+	}
+	mutex_unlock(&v14->lock);
+	if (ret)
+		return ret;
+
+	if (wait_event_timeout(v14->bl_wait, !READ_ONCE(v14->bl_pending), DCP_V14_BL_FLIP_WAIT))
+		return 0;
+	return dcp_v14_brightness_commit(v14);
+}
+
+static const struct backlight_ops dcp_v14_backlight_ops = {
+	.update_status = dcp_v14_backlight_update,
+};
+
+/* Nits, like the M1/M2 panels: 0 to the DT maximum, linear in luminance. */
+static void dcp_v14_backlight_register(struct work_struct *work)
+{
+	struct apple_dcp_v14 *v14 = container_of(work, struct apple_dcp_v14, bl_register_work);
+	struct backlight_properties props = {
+		.type = BACKLIGHT_PLATFORM,
+		.scale = BACKLIGHT_SCALE_LINEAR,
+		.max_brightness = v14->bl_max,
+		.brightness = min_t(u32, DCP_V14_DEFAULT_NITS, v14->bl_max),
+	};
+	struct backlight_device *bd;
+
+	mutex_lock(&v14->bl_lock);
+	if (!v14->bl_detached && !v14->bl_dev) {
+		bd = backlight_device_register("apple-panel-bl", v14->dev, v14,
+					       &dcp_v14_backlight_ops, &props);
+		if (IS_ERR(bd))
+			dev_err(v14->dev, "no panel backlight device: %pe\n", bd);
+		else
+			WRITE_ONCE(v14->bl_dev, bd);
+	}
+	mutex_unlock(&v14->bl_lock);
+}
+
+/* KMS goes away: so does the backlight device, before the CRTC it commits to. */
+static void dcp_v14_backlight_detach(struct apple_dcp_v14 *v14)
+{
+	struct backlight_device *bd;
+
+	mutex_lock(&v14->bl_lock);
+	v14->bl_detached = true;
+	bd = v14->bl_dev;
+	WRITE_ONCE(v14->bl_dev, NULL);
+	mutex_unlock(&v14->bl_lock);
+	cancel_work_sync(&v14->bl_register_work);
+	backlight_device_unregister(bd);
+}
+
+/* 0 nits while the CRTC is off, the requested nits once it is on again. Called with the lock held. */
+static void dcp_v14_brightness_power_locked(struct apple_dcp_v14 *v14, bool on)
+{
+	lockdep_assert_held(&v14->lock);
+	if (!v14->bl_max)
+		return;
+	v14->bl_off = !on;
+	dcp_v14_brightness_changed(v14);
+}
+
+
+/*
  * Swap start, then the swap; returns once the firmware completed that swap.
  * @ctm_state, if set, carries the colour matrix to send first.
  */
@@ -2574,6 +2805,7 @@ static int dcp_v14_swap(struct apple_dcp_v14 *v14, const u8 *surface, u64 iova,
 	bool typec = READ_ONCE(v14->typec);
 	u32 max_width = typec ? v14->typec_width : v14->panel_width;
 	u32 max_height = typec ? v14->typec_height : v14->panel_height;
+	u64 brightness = 0;
 	u8 *swap;
 	u32 id;
 	int ret;
@@ -2612,6 +2844,8 @@ static int dcp_v14_swap(struct apple_dcp_v14 *v14, const u8 *surface, u64 iova,
 	if (!ret) {
 		dcp_v14_encode_swap(swap, id, DCP_V14_BLACK, surface, iova, width, height,
 				    dst_y, DCP_V14_LAYER);
+		if (!v14->external && !typec)
+			brightness = dcp_v14_brightness_encode(v14, swap);
 		ret = dcp_v14_call_guarded(v14, A(407), swap, DCP_V14_SWAP_SIZE, result, sizeof(result),
 				   id, dcp_v14_swap_admit, &admission);
 		/* The swap status sits at byte 5 of the reply. */
@@ -2625,6 +2859,8 @@ static int dcp_v14_swap(struct apple_dcp_v14 *v14, const u8 *surface, u64 iova,
 	 */
 	if (ret && !v14->external && !v14->typec)
 		v14->failed = true;
+	else if (!ret && !v14->external && !typec)
+		dcp_v14_brightness_done(v14, brightness);
 	mutex_unlock(&v14->lock);
 
 	kfree(swap);
@@ -3119,6 +3355,8 @@ static void dcp_v14_panel_on_locked(struct apple_dcp_v14 *v14)
 	if (!ret) {
 		v14->panel_off = false;
 		v14->ctm_valid = false;
+		/* The next frame carries the brightness again. */
+		dcp_v14_brightness_changed(v14);
 	}
 	if (ret)
 		dev_warn(v14->dev, "panel on (A472(1)) refused: %d; it stays dark until its CRTC is switched on again\n",
@@ -3305,6 +3543,7 @@ void iomfb_v14_7_poweron(struct apple_dcp *dcp)
 		return;
 	mutex_lock(&v14->lock);
 	v14->panel_blank = false;
+	dcp_v14_brightness_power_locked(v14, true);
 	/*
 	 * Powered off with the lid closed: on again once the lid is open. A
 	 * CRTC switched on while it is closed (the panel's connector reads
@@ -3345,6 +3584,10 @@ void iomfb_v14_7_poweroff(struct apple_dcp *dcp)
 	 * is closed (J613): then the panel is powered off.
 	 */
 	if (v14 && v14->started) {
+		/* The black swap carries 0 nits: the backlight goes off with the picture. */
+		mutex_lock(&v14->lock);
+		dcp_v14_brightness_power_locked(v14, false);
+		mutex_unlock(&v14->lock);
 		if (!dcp_v14_panel_dark(v14))
 			dcp_v14_present(v14, NULL, 0, 0, 0, NULL);
 		mutex_lock(&v14->lock);
